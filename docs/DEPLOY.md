@@ -88,8 +88,7 @@ export PYTHONPATH=/userdata/dfkv:$PYTHONPATH
 export DFKV_LIB=/userdata/dfkv/libdfkv.so
 export DFKV_RDMA=1                       # 启用 RDMA 数据面（否则 TCP）
 export DFKV_RDMA_DEV=ib7s400p0           # 数据面设备；多轨用逗号列表 ib7s400p0,ib7s400p1,...
-# 可选: DFKV_RDMA_DEPTH=16 (单连接 pipeline, 利于 PUT; client+server 两端都要设)
-#       DFKV_RDMA_WORKERS=8 (server GET 并行, server 端设)
+# 可选: DFKV_RDMA_DEPTH=16 (单连接 pipeline, K 个请求在途; 利于 PUT; client+server 两端都要设)
 sglang serve ... \
   --enable-hierarchical-cache --hicache-write-policy write_through \
   --hicache-mem-layout page_first_direct --hicache-io-backend direct \

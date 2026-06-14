@@ -14,10 +14,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
-#include "kv_store.h"  // Status
+#include "kv_store.h"   // Status
+#include "rdma_verbs.h"  // rdma::RcEndpoint
 
 namespace dfkv {
 
@@ -55,6 +59,11 @@ class RdmaServer {
   int port_ = 0;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  // Track per-connection Serve threads + their endpoints so Stop() can wake them
+  // out of WaitComp and join them before the handler's owner is destroyed.
+  std::mutex conn_mu_;
+  std::vector<std::thread> conn_threads_;
+  std::unordered_set<rdma::RcEndpoint*> live_eps_;
 };
 
 }  // namespace dfkv

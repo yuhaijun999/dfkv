@@ -1,5 +1,9 @@
 #include "rdma_verbs.h"
 
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+
 #include <cstring>
 
 #include "net_util.h"  // PutU32/GetU32/PutU64 little-endian codec
@@ -41,10 +45,17 @@ void RcEndpoint::Close() {
   if (chan_) { ibv_destroy_comp_channel(chan_); chan_ = nullptr; }
   if (pd_) { ibv_dealloc_pd(pd_); pd_ = nullptr; }
   if (ctx_) { ibv_close_device(ctx_); ctx_ = nullptr; }
+  if (wake_rfd_ >= 0) { ::close(wake_rfd_); wake_rfd_ = -1; }
+  if (wake_wfd_ >= 0) { ::close(wake_wfd_); wake_wfd_ = -1; }
 }
 
 bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
+
+  int wp[2];
+  if (::pipe(wp) != 0) return false;  // self-pipe to interrupt WaitComp
+  ::fcntl(wp[0], F_SETFL, O_NONBLOCK);
+  wake_rfd_ = wp[0]; wake_wfd_ = wp[1];
 
   int n = 0;
   ibv_device** list = ibv_get_device_list(&n);
@@ -108,8 +119,31 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   local_.lid = pa.lid;
   local_.qpn = qp_->qp_num;
   local_.psn = qp_->qp_num & 0xFFFFFF;  // deterministic, unique per QP
+
+  // Pick the source GID. On IB the LID is used for addressing (GID is along for
+  // the ride), but on RoCE (Ethernet link layer, lid==0) the QP is addressed by
+  // GID, and RoCEv2 GIDs are not at index 0 — pick a RoCEv2 entry so RoCE works.
+  gid_index_ = 0;
   union ibv_gid gid{};
-  if (ibv_query_gid(ctx_, ib_port_, 0, &gid) == 0) std::memcpy(local_.gid, gid.raw, 16);
+  ibv_query_gid(ctx_, ib_port_, 0, &gid);
+  if (pa.lid == 0) {  // RoCE: pick a RoCEv2 GID, preferring a routable (non
+                      // link-local fe80::) one — link-local GIDs don't resolve
+                      // for loopback/cross-host the way IPv4-mapped GIDs do.
+    int any_v2 = -1;
+    for (int i = 0; i < pa.gid_tbl_len; ++i) {
+      ibv_gid_entry e{};
+      if (ibv_query_gid_ex(ctx_, ib_port_, i, &e, 0) != 0) continue;
+      if (e.gid_type != IBV_GID_TYPE_ROCE_V2) continue;
+      bool link_local = e.gid.raw[0] == 0xfe && (e.gid.raw[1] & 0xc0) == 0x80;
+      if (any_v2 < 0) any_v2 = i;       // remember first RoCEv2 as fallback
+      if (!link_local) { gid_index_ = i; gid = e.gid; any_v2 = -1; break; }
+    }
+    if (any_v2 >= 0) {                   // only link-local RoCEv2 available
+      ibv_gid_entry e{};
+      if (ibv_query_gid_ex(ctx_, ib_port_, any_v2, &e, 0) == 0) { gid_index_ = any_v2; gid = e.gid; }
+    }
+  }
+  std::memcpy(local_.gid, gid.raw, 16);
   return true;
 }
 
@@ -130,14 +164,13 @@ bool RcEndpoint::Connect(const QpInfo& remote) {
   } else {                // RoCE: GRH/GID routing
     at.ah_attr.is_global = 1;
     std::memcpy(at.ah_attr.grh.dgid.raw, remote.gid, 16);
-    at.ah_attr.grh.sgid_index = 0;
+    at.ah_attr.grh.sgid_index = gid_index_;
     at.ah_attr.grh.hop_limit = 1;
   }
-  if (ibv_modify_qp(qp_, &at,
+  int rtr = ibv_modify_qp(qp_, &at,
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-        IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
-    return false;
-  }
+        IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+  if (rtr != 0) return false;
 
   // RTR -> RTS
   ibv_qp_attr ts{};
@@ -147,11 +180,10 @@ bool RcEndpoint::Connect(const QpInfo& remote) {
   ts.rnr_retry = 7;
   ts.sq_psn = local_.psn;
   ts.max_rd_atomic = 1;
-  if (ibv_modify_qp(qp_, &ts,
+  int rts = ibv_modify_qp(qp_, &ts,
         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-        IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
-    return false;
-  }
+        IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+  if (rts != 0) return false;
   return true;
 }
 
@@ -223,14 +255,25 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max) {
     int got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return got;  // >0 completions, or <0 error
     // No completion ready: arm notify, poll once more (close the race where a
-    // completion arrived between the empty poll and the notify), then block.
+    // completion arrived between the empty poll and the notify), then block on
+    // the comp-channel fd OR the wake pipe (so Stop() can interrupt us).
     if (ibv_req_notify_cq(cq_, 0) != 0) return -1;
     got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return got;
-    ibv_cq* ev_cq = nullptr; void* ev_ctx = nullptr;
-    if (ibv_get_cq_event(chan_, &ev_cq, &ev_ctx) != 0) return -1;
-    ibv_ack_cq_events(ev_cq, 1);
+    pollfd pfds[2] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0}};
+    int pr = ::poll(pfds, 2, -1);
+    if (pr < 0) { if (errno == EINTR) continue; return -1; }
+    if (pfds[1].revents & POLLIN) return -1;  // woken for shutdown
+    if (pfds[0].revents & POLLIN) {
+      ibv_cq* ev_cq = nullptr; void* ev_ctx = nullptr;
+      if (ibv_get_cq_event(chan_, &ev_cq, &ev_ctx) != 0) return -1;
+      ibv_ack_cq_events(ev_cq, 1);
+    }
   }
+}
+
+void RcEndpoint::Wake() {
+  if (wake_wfd_ >= 0) { char b = 1; ssize_t n = ::write(wake_wfd_, &b, 1); (void)n; }
 }
 
 }  // namespace rdma

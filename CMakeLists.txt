@@ -82,12 +82,19 @@ if(DFKV_BUILD_TESTS)
   include(GoogleTest)
 
   file(GLOB DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cc)
+  # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdma_loopback_test.cc)
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
     target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(${name})
   endforeach()
+  if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
+    add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdma_loopback_test.cc)
+    target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
+    gtest_discover_tests(rdma_loopback_test)
+  endif()
 
   # Python plugin test (ctypes -> libdfkv.so -> dfkv_server). No GPU/torch.
   find_program(PYTHON3 python3)

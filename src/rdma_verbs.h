@@ -80,9 +80,12 @@ class RcEndpoint {
                        ibv_mr* payload_mr, size_t hdr_bytes);
 
   // Block until at least one completion, drain up to `max` into out[]; returns
-  // the count (>0) or <0 on error. wr_id of each wc = the slot. Used for both
-  // single round-trips (max=1) and pipelined batches.
+  // the count (>0), or <0 on error / when Wake() is called. wr_id of each wc =
+  // the slot. Used for single round-trips (max=1) and pipelined batches.
   int WaitComp(ibv_wc* out, int max);
+  // Unblock a thread sitting in WaitComp (so the server can join its Serve
+  // threads at shutdown). Thread-safe vs the waiter.
+  void Wake();
 
  private:
   void Close();
@@ -93,6 +96,8 @@ class RcEndpoint {
   ibv_comp_channel* chan_ = nullptr;
   ibv_qp* qp_ = nullptr;
   uint8_t ib_port_ = 1;
+  int gid_index_ = 0;       // local source GID index (RoCEv2 on Ethernet link layer)
+  int wake_rfd_ = -1, wake_wfd_ = -1;  // self-pipe to interrupt WaitComp on stop
   ibv_mtu mtu_ = IBV_MTU_4096;
   unsigned cq_armed_unacked_ = 0;
 

@@ -6,12 +6,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,9 +56,15 @@ void RdmaServer::Stop() {
   if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);  // wake accept()
   if (accept_thread_.joinable()) accept_thread_.join();
   if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
-  // Per-connection serve threads are detached: they block in RDMA completion
-  // waits and are reclaimed on process exit. We intentionally do not join them
-  // (no clean interrupt for a blocked CQ wait), which keeps Stop() bounded.
+  // Wake every in-flight Serve thread out of WaitComp, then join them all so no
+  // handler call can race the owner's destruction after Stop() returns.
+  std::vector<std::thread> threads;
+  {
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    for (rdma::RcEndpoint* ep : live_eps_) ep->Wake();
+    threads.swap(conn_threads_);
+  }
+  for (auto& t : threads) if (t.joinable()) t.join();
 }
 
 void RdmaServer::AcceptLoop() {
@@ -71,7 +73,11 @@ void RdmaServer::AcceptLoop() {
     if (fd < 0) { if (!running_) break; continue; }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    std::thread([this, fd] { Serve(fd); }).detach();
+    timeval tv{10, 0};  // bound the bootstrap handshake so a stalled client
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));  // can't hang Stop()
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    if (!running_) { ::close(fd); break; }
+    conn_threads_.emplace_back([this, fd] { Serve(fd); });
   }
 }
 
@@ -85,15 +91,6 @@ size_t ServerDepth() {
   return 1;
 }
 
-size_t ServerWorkers(size_t K) {
-  // GET worker-pool size per connection (only used when pipelining, K>1).
-  // Default min(K, 8); override with DFKV_RDMA_WORKERS.
-  if (K <= 1) return 0;
-  size_t w = K < 8 ? K : 8;
-  const char* e = std::getenv("DFKV_RDMA_WORKERS");
-  if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) w = (size_t)v; }
-  return w < K ? w : K;
-}
 }  // namespace
 
 void RdmaServer::Serve(int boot_fd) {
@@ -128,111 +125,73 @@ void RdmaServer::Serve(int boot_fd) {
   ::close(boot_fd);  // bootstrap done
   if (!ok) return;
 
+  // Register this endpoint so Stop() can Wake() us out of WaitComp and join. The
+  // running_ check under conn_mu_ closes the race with a concurrent Stop(): either
+  // Stop sees us in live_eps_ (and wakes us) or we see running_==false here.
+  {
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    if (!running_) return;
+    live_eps_.insert(&ep);
+  }
+
   // Send-slot free list (a reply uses one send slot until its SEND completes).
-  // Owned by the serve thread only (alloc on RECV, free on SEND comp) — no lock.
   std::vector<size_t> free_send;
   free_send.reserve(K);
   for (size_t i = 0; i < K; ++i) free_send.push_back(i);
 
   // Build the reply for one request into ep.sbuf[slot]; returns the send length
   // or -1 on overflow. For kRange with a zero-copy range handler set, the payload
-  // is read straight into sbuf+kRespPrefix (no std::string) — server-side zero
-  // copy. Other ops use the generic handler. Thread-safe: distinct slots, and the
-  // handlers are thread-safe (DiskCacheGroup locks); callers serialize post_send.
-  auto build_reply = [&](size_t slot, uint8_t op, uint64_t id, uint32_t index,
-                         uint32_t ksize, uint64_t offset, uint64_t length,
-                         const char* payload, uint64_t payload_len) -> long {
+  // is read straight into sbuf+kRespPrefix (no std::string) — server-side zero copy.
+  auto build_reply = [&](size_t slot, const ReqFields& rq, const char* payload) -> long {
     char* sb = ep.sbuf(slot);
-    if (op == static_cast<uint8_t>(WireOp::kRange) && range_handler_) {
+    if (rq.op == static_cast<uint8_t>(WireOp::kRange) && range_handler_) {
       size_t out_len = 0;
-      Status st = range_handler_(id, index, ksize, offset, length,
+      Status st = range_handler_(rq.id, rq.index, rq.size, rq.offset, rq.length,
                                  sb + kRespPrefix, ep.cap() - kRespPrefix, &out_len);
       uint64_t dlen = (st == Status::kOk) ? out_len : 0;
       EncodeResp(sb, st, dlen);
       return static_cast<long>(kRespPrefix + dlen);
     }
     std::string data;
-    Status st = handler_(op, id, index, ksize, offset, length, payload, payload_len, &data);
+    Status st = handler_(rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length,
+                         payload, rq.payload_len, &data);
     if (kRespPrefix + data.size() > ep.cap()) return -1;
     EncodeResp(sb, st, data.size());
     if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
     return static_cast<long>(kRespPrefix + data.size());
   };
 
-  // Worker pool: when pipelining (K>1), the slow part of a GET (reading the
-  // 2.74 MiB object) is dispatched to workers so a single connection's in-flight
-  // reads run in parallel; the serve thread keeps reaping completions. post_send
-  // on the shared QP is serialized by qp_mu. PUT (large inline payload that
-  // lives in rbuf) and the K==1 path stay on the serve thread. Workers are joined
-  // before ep is destroyed, so ep always outlives them (no use-after-free).
-  struct WorkItem { uint8_t op; uint64_t id; uint32_t index, ksize; uint64_t offset, length; size_t slot; };
-  std::mutex qmu, qp_mu;  // qp_mu serializes all post_send/post_recv on the shared QP
-  std::condition_variable qcv;
-  std::deque<WorkItem> queue;
-  std::atomic<bool> failed{false};
-  bool done = false;
-  const size_t W = ServerWorkers(K);
-  auto worker = [&] {
-    for (;;) {
-      WorkItem it;
-      {
-        std::unique_lock<std::mutex> lk(qmu);
-        qcv.wait(lk, [&] { return done || !queue.empty(); });
-        if (queue.empty()) return;  // done
-        it = queue.front(); queue.pop_front();
-      }
-      long sl = build_reply(it.slot, it.op, it.id, it.index, it.ksize, it.offset, it.length, nullptr, 0);
-      if (sl < 0) { failed = true; continue; }
-      std::lock_guard<std::mutex> lk(qp_mu);
-      if (!ep.PostSend(it.slot, static_cast<size_t>(sl))) failed = true;
-    }
-  };
-  std::vector<std::thread> workers;
-  for (size_t i = 0; i < W; ++i) workers.emplace_back(worker);
-
+  // Single-threaded serve loop: reap completions and process each RECV inline, in
+  // arrival (= request) order, replying on a free send slot. Replies MUST go out
+  // in request order: the pipelined client binds each reply's destination buffer
+  // at recv-post time (zero-copy scatter), so an out-of-order reply would land in
+  // the wrong buffer. Depth K still gives K-in-flight pipelining; we just don't
+  // reorder. (An earlier parallel GET worker pool was removed for this reason —
+  // it broke zero-copy correctness for marginal gain; GET scales via connections.)
   std::vector<ibv_wc> wcs(K);
   bool fail = false;
-  while (running_ && !fail && !failed.load(std::memory_order_relaxed)) {
+  while (running_ && !fail) {
     int g = ep.WaitComp(wcs.data(), static_cast<int>(K));
     if (g <= 0) break;
     for (int w = 0; w < g && !fail; ++w) {
       const ibv_wc& wc = wcs[w];
       if (wc.status != IBV_WC_SUCCESS) { fail = true; break; }
-      if (wc.opcode == IBV_WC_SEND) {
-        free_send.push_back(static_cast<size_t>(wc.wr_id));
-        continue;
-      }
+      if (wc.opcode == IBV_WC_SEND) { free_send.push_back(static_cast<size_t>(wc.wr_id)); continue; }
       if (wc.opcode != IBV_WC_RECV || wc.byte_len < kReqPrefix) { fail = true; break; }
       size_t r = static_cast<size_t>(wc.wr_id);
       ReqFields rq;
       if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }  // bad protocol version
       if (free_send.empty()) { fail = true; break; }
       size_t s = free_send.back(); free_send.pop_back();
-
-      // GET/Exist/Stats (no payload needed past parse) -> pool when pipelining.
-      if (W > 0 && rq.op != static_cast<uint8_t>(WireOp::kCache)) {
-        WorkItem it{rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length, s};
-        { std::lock_guard<std::mutex> ql(qp_mu); if (!ep.PostRecv(r)) { fail = true; break; } }  // fields copied; safe to re-arm
-        { std::lock_guard<std::mutex> lk(qmu); queue.push_back(it); }
-        qcv.notify_one();
-        continue;
-      }
-      // Inline: PUT (payload in rbuf) or non-pipelined path. GET here (W==0) still
-      // gets server-side zero-copy via build_reply's range-handler branch.
       const char* payload = (rq.payload_len && wc.byte_len >= kReqPrefix + rq.payload_len)
                                 ? ep.rbuf(r) + kReqPrefix : nullptr;
-      long sl = build_reply(s, rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length,
-                            payload, rq.payload_len);
-      { std::lock_guard<std::mutex> ql(qp_mu); if (!ep.PostRecv(r)) { fail = true; break; } }
+      long sl = build_reply(s, rq, payload);   // consumes rbuf[r] for a PUT payload
+      if (!ep.PostRecv(r)) { fail = true; break; }  // re-arm (request consumed)
       if (sl < 0) { fail = true; break; }
-      std::lock_guard<std::mutex> sg(qp_mu);
       if (!ep.PostSend(s, static_cast<size_t>(sl))) { fail = true; break; }
     }
   }
-  // Drain workers before ep is destroyed (ep must outlive every worker).
-  { std::lock_guard<std::mutex> lk(qmu); done = true; }
-  qcv.notify_all();
-  for (auto& t : workers) if (t.joinable()) t.join();
+  { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
   // ep dtor tears down the QP; the peer observes the drop as an error completion.
 }
 
