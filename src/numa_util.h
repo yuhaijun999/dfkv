@@ -1,0 +1,89 @@
+/* Best-effort NUMA placement for RDMA buffers and server serve threads.
+ * On multi-socket nodes the RDMA NICs are split across sockets; if a NIC DMAs
+ * from memory on the far socket the transfer crosses the inter-socket link and
+ * caps aggregate bandwidth (multi-rail then can't beat a single local NIC). This
+ * binds a connection's registered buffers — and the server's per-connection serve
+ * thread — to the NUMA node of its RDMA device, so each rail stays local.
+ *
+ * Opt-in via env DFKV_RDMA_NUMA (off by default; only meaningful on multi-socket
+ * hosts). All ops are best-effort: unknown node / sysfs absent => no-op. Uses raw
+ * syscalls + sysfs so there is no libnuma build dependency. */
+#ifndef DFKV_NUMA_UTIL_H_
+#define DFKV_NUMA_UTIL_H_
+
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace dfkv {
+namespace numa {
+
+inline bool Enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("DFKV_RDMA_NUMA");
+    return e && *e && std::strcmp(e, "0") != 0;
+  }();
+  return v;
+}
+
+// NUMA node of an RDMA device (sysfs), or -1 if unknown / single-node.
+inline int DeviceNode(const char* dev) {
+  if (!dev || !*dev) return -1;
+  char path[256];
+  std::snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/numa_node", dev);
+  FILE* f = std::fopen(path, "r");
+  if (!f) return -1;
+  int n = -1;
+  if (std::fscanf(f, "%d", &n) != 1) n = -1;
+  std::fclose(f);
+  return n;  // -1 on single-node systems
+}
+
+// Bind [addr, len) (page-aligned) to `node` so its pages fault in locally.
+// MPOL_BIND = 2. Best-effort.
+inline void BindMemory(void* addr, size_t len, int node) {
+  if (!Enabled() || node < 0 || node >= 1024) return;
+  unsigned long mask[1024 / (8 * sizeof(unsigned long))] = {0};
+  mask[node / (8 * sizeof(unsigned long))] |= 1UL << (node % (8 * sizeof(unsigned long)));
+  ::syscall(SYS_mbind, addr, len, 2 /*MPOL_BIND*/, mask, 1024UL, 0u);
+}
+
+// Pin the calling thread to the CPUs of `node` (sysfs cpulist). Best-effort.
+inline void PinThreadToNode(int node) {
+  if (!Enabled() || node < 0) return;
+  char path[256];
+  std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+  FILE* f = std::fopen(path, "r");
+  if (!f) return;
+  char buf[4096] = {0};
+  size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+  std::fclose(f);
+  if (n == 0) return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  // cpulist like "0-23,48-71"
+  const char* p = buf;
+  while (*p) {
+    int lo = -1, hi = -1;
+    int consumed = 0;
+    if (std::sscanf(p, "%d-%d%n", &lo, &hi, &consumed) >= 2) {
+      for (int c = lo; c <= hi && c < CPU_SETSIZE; ++c) CPU_SET(c, &set);
+    } else if (std::sscanf(p, "%d%n", &lo, &consumed) >= 1) {
+      if (lo >= 0 && lo < CPU_SETSIZE) CPU_SET(lo, &set);
+    } else {
+      break;
+    }
+    p += consumed;
+    while (*p == ',' || *p == ' ' || *p == '\n') ++p;
+  }
+  if (CPU_COUNT(&set) > 0) ::sched_setaffinity(0, sizeof(set), &set);
+}
+
+}  // namespace numa
+}  // namespace dfkv
+
+#endif  // DFKV_NUMA_UTIL_H_

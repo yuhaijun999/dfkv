@@ -63,6 +63,7 @@ class RcEndpoint {
 
   size_t depth() const { return depth_; }
   size_t cap() const { return cap_; }
+  int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
   char* sbuf(size_t slot) { return sbuf_[slot]; }
   char* rbuf(size_t slot) { return rbuf_[slot]; }
 
@@ -97,6 +98,7 @@ class RcEndpoint {
   ibv_qp* qp_ = nullptr;
   uint8_t ib_port_ = 1;
   int gid_index_ = 0;       // local source GID index (RoCEv2 on Ethernet link layer)
+  int numa_node_ = -1;      // NUMA node of the device (for buffer/thread placement)
   int wake_rfd_ = -1, wake_wfd_ = -1;  // self-pipe to interrupt WaitComp on stop
   ibv_mtu mtu_ = IBV_MTU_4096;
   unsigned cq_armed_unacked_ = 0;

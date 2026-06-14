@@ -6,7 +6,8 @@
 
 #include <cstring>
 
-#include "net_util.h"  // PutU32/GetU32/PutU64 little-endian codec
+#include "net_util.h"   // PutU32/GetU32/PutU64 little-endian codec
+#include "numa_util.h"  // best-effort NUMA buffer placement
 
 namespace dfkv {
 namespace rdma {
@@ -102,11 +103,16 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
     Close(); return false;
   }
 
-  // buffers + MRs
+  // buffers + MRs. Bind to the device's NUMA node before registration so the
+  // pages fault in locally (mbind sets policy; reg_mr faults/pins them). For our
+  // sizes (>=128 KiB) new[] is mmap-backed = page-aligned, which mbind needs.
+  numa_node_ = numa::DeviceNode(dev_name);
   sbuf_.resize(depth_, nullptr); rbuf_.resize(depth_, nullptr);
   smr_.resize(depth_, nullptr); rmr_.resize(depth_, nullptr);
   for (size_t i = 0; i < depth_; ++i) {
     sbuf_[i] = new char[cap_]; rbuf_[i] = new char[cap_];
+    numa::BindMemory(sbuf_[i], cap_, numa_node_);
+    numa::BindMemory(rbuf_[i], cap_, numa_node_);
     smr_[i] = ibv_reg_mr(pd_, sbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
     rmr_[i] = ibv_reg_mr(pd_, rbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
     if (!smr_[i] || !rmr_[i]) { Close(); return false; }

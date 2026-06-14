@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "net_util.h"     // ReadAll / WriteAll / Get*/Put*
+#include "numa_util.h"    // pin serve thread to the device's NUMA node
 #include "rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport.h"    // kReqPrefix, kRespPrefix
 
@@ -104,6 +105,7 @@ void RdmaServer::Serve(int boot_fd) {
   rdma::RcEndpoint ep;
   const size_t K = ServerDepth();
   if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, K)) { ::close(boot_fd); return; }
+  numa::PinThreadToNode(ep.numa_node());  // keep this conn's serve thread NUMA-local to its NIC
   // QP bootstrap: read client's info, send ours (symmetric to the client).
   char peer[rdma::kQpInfoBytes], mine[rdma::kQpInfoBytes];
   rdma::SerializeQpInfo(ep.Local(), mine);
