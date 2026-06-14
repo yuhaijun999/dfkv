@@ -12,8 +12,6 @@
 namespace dfkv {
 
 namespace {
-constexpr size_t kMaxIdlePerNode = 16;  // cap pooled idle conns per node (each is depth*max_msg*2)
-
 int EnvInt(const char* name, int dflt) {
   const char* v = std::getenv(name);
   if (!v || !*v) return dflt;
@@ -74,6 +72,12 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
   io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
+  // Idle-connection pool cap. The pool naturally bounds at peak concurrency
+  // (each thread holds <=1 conn); this only guards against a thread-count spike
+  // leaving many idle conns. Must be >= peak concurrency or releases churn
+  // (destroy+recreate every op), which fails the bootstrap under load. Default
+  // 256 covers typical fan-out; raise via DFKV_RDMA_POOL_MAX for more threads.
+  pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 256));
 }
 
 RdmaTransport::~RdmaTransport() {
@@ -130,7 +134,7 @@ void RdmaTransport::Release(const std::string& node, Conn* c) {
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto& v = pool_[node];
-    if (v.size() < kMaxIdlePerNode) { v.push_back(c); return; }
+    if (v.size() < pool_max_) { v.push_back(c); return; }
   }
   Destroy(c);  // pool full -> drop (and tear down the QP/MRs) instead of growing
 }

@@ -103,9 +103,7 @@ void RdmaServer::Serve(int boot_fd) {
 
   rdma::RcEndpoint ep;
   const size_t K = ServerDepth();
-  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, K)) {
-    ::close(boot_fd); return;
-  }
+  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, K)) { ::close(boot_fd); return; }
   // QP bootstrap: read client's info, send ours (symmetric to the client).
   char peer[rdma::kQpInfoBytes], mine[rdma::kQpInfoBytes];
   rdma::SerializeQpInfo(ep.Local(), mine);

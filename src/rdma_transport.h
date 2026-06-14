@@ -66,6 +66,7 @@ class RdmaTransport : public Transport {
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
   int io_ms_ = 10000;                 // bootstrap TCP IO timeout (DFKV_RDMA_IO_MS)
+  size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
   std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
   std::atomic<size_t> rr_{0};         // round-robin selector across devs_
 };
