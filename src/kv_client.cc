@@ -181,21 +181,24 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     const size_t n = groups[g].first.second;
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> keys;
+    std::vector<RangeDst> dsts;
     keys.reserve(idx.size());
-    for (size_t k : idx) keys.push_back(ToBlockKey(items[k].key));
-    std::vector<std::string> raws;
-    std::vector<Status> sts = t_->RangeMany(node, keys, 0, ValueHeader::kSize + n, &raws);
+    dsts.reserve(idx.size());
+    for (size_t k : idx) {
+      keys.push_back(ToBlockKey(items[k].key));
+      dsts.push_back(RangeDst{items[k].out, n});
+    }
+    // Zero-copy: the payload lands straight in items[].out; hdrs[] gets the value
+    // header for geometry/CRC verification (CRC is computed over the dst buffer).
+    std::vector<std::string> hdrs;
+    std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
     for (size_t m = 0; m < idx.size(); ++m) {
-      if (sts[m] != Status::kOk) continue;
-      const std::string& raw = raws[m];
-      if (raw.size() < ValueHeader::kSize) continue;
+      if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
       ValueHeader h;
-      if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) continue;
+      if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
       if (!HeaderMatches(self_hdr_, h)) continue;
-      if (h.payload_len != n || raw.size() < ValueHeader::kSize + n) continue;
-      const char* p = raw.data() + ValueHeader::kSize;
-      if (Crc32(p, n) != h.crc32) continue;
-      std::memcpy(items[idx[m]].out, p, n);
+      if (h.payload_len != n) continue;
+      if (Crc32(items[idx[m]].out, n) != h.crc32) continue;  // verify in-place
       hit[idx[m]] = 1;
     }
   });

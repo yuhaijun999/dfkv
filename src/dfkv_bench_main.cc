@@ -128,9 +128,12 @@ int main(int argc, char** argv) {
     fails = 0;
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
-      std::vector<std::string> outs(w);
+      // Reuse per-thread destination buffers across calls so the RDMA MR cache
+      // hits (models SGLang HiCache's stable registered host pool / zero-copy).
+      thread_local std::vector<std::string> outs;
+      if (outs.size() < batch) { outs.resize(batch); for (auto& o : outs) o.resize(size); }
       std::vector<KvGetItem> items(w);
-      for (size_t j = 0; j < w; ++j) { outs[j].resize(size); items[j] = {key(base + j), &outs[j][0], size}; }
+      for (size_t j = 0; j < w; ++j) items[j] = {key(base + j), &outs[j][0], size};
       auto hits = c.BatchGet(items);
       size_t f = 0; for (bool h : hits) if (!h) ++f; return f;
     }, &lat, &fails);

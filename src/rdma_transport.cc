@@ -265,4 +265,69 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
   return res;
 }
 
+std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
+                                             const std::vector<BlockKey>& keys,
+                                             const std::vector<RangeDst>& dsts,
+                                             size_t header_size,
+                                             std::vector<std::string>* hdrs) {
+  const size_t n = keys.size();
+  hdrs->assign(n, std::string());
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  const size_t hdr_bytes = kRespPrefix + header_size;  // resp prefix + value header
+  if (hdr_bytes > max_msg_) return Transport::RangeInto(node, keys, dsts, header_size, hdrs);
+
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    // Register the destination buffers (cached). Any failure => give the conn
+    // back and fall back to the copy-based path for the whole call.
+    std::vector<ibv_mr*> mrs(w, nullptr);
+    bool regok = true;
+    for (size_t j = 0; j < w && regok; ++j) {
+      mrs[j] = ep.RegisterUser(dsts[base + j].payload, dsts[base + j].n);
+      if (!mrs[j]) regok = false;
+    }
+    if (!regok) { Release(node, c); return Transport::RangeInto(node, keys, dsts, header_size, hdrs); }
+    // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
+    for (size_t j = 0; j < w && conn_ok; ++j) {
+      if (!ep.PostRecvScatter(j, dsts[base + j].payload, dsts[base + j].n, mrs[j], hdr_bytes)) { conn_ok = false; break; }
+      EncodePrefix(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + dsts[base + j].n, 0);
+      if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
+    }
+    if (!conn_ok) break;
+    std::vector<ibv_wc> wcs(2 * w);
+    std::vector<uint32_t> rbytes(w, 0);
+    int need = static_cast<int>(2 * w);
+    while (need > 0) {
+      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
+      if (g <= 0) { conn_ok = false; break; }
+      for (int i = 0; i < g; ++i) {
+        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+        --need;
+      }
+      if (!conn_ok) break;
+    }
+    if (!conn_ok) break;
+    for (size_t j = 0; j < w; ++j) {
+      uint32_t rb = rbytes[j];
+      if (rb < kRespPrefix) continue;
+      Status st = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(j)[0]));
+      res[base + j] = st;            // payload (if any) already in dsts[].payload
+      if (st == Status::kOk) {
+        if (rb >= hdr_bytes) (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
+        else res[base + j] = Status::kIOError;
+      }
+    }
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
+}
+
 }  // namespace dfkv

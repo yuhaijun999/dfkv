@@ -5,6 +5,7 @@
 #define DFKV_TRANSPORT_H_
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,8 @@ constexpr size_t kRespPrefix = 1 + 8;  // = 9
 
 // One write in a batch (data must outlive the CacheMany call).
 struct CacheItem { BlockKey key; const void* data; size_t len; };
+// One zero-copy read target: `n` payload bytes are written straight into `payload`.
+struct RangeDst { void* payload; size_t n; };
 
 class Transport {
  public:
@@ -58,6 +61,31 @@ class Transport {
     r.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i)
       r.push_back(Range(node, keys[i], offset, length, &(*outs)[i]));
+    return r;
+  }
+
+  // Zero-copy read: the payload for keys[i] lands directly in dsts[i].payload
+  // (RDMA scatters [resp-prefix | first header_size bytes] into a scratch and the
+  // rest into the caller buffer). hdrs[i] gets the first header_size value-header
+  // bytes for the caller to verify. Default: a Range + split-copy (no zero-copy).
+  virtual std::vector<Status> RangeInto(const std::string& node,
+                                        const std::vector<BlockKey>& keys,
+                                        const std::vector<RangeDst>& dsts,
+                                        size_t header_size,
+                                        std::vector<std::string>* hdrs) {
+    hdrs->assign(keys.size(), std::string());
+    std::vector<Status> r;
+    r.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      std::string raw;
+      Status st = Range(node, keys[i], 0, header_size + dsts[i].n, &raw);
+      r.push_back(st);
+      if (st != Status::kOk || raw.size() < header_size) continue;
+      (*hdrs)[i].assign(raw.data(), header_size);
+      size_t pn = raw.size() - header_size;
+      if (pn > dsts[i].n) pn = dsts[i].n;
+      std::memcpy(dsts[i].payload, raw.data() + header_size, pn);
+    }
     return r;
   }
 };

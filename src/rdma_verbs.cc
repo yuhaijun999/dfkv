@@ -30,6 +30,8 @@ void RcEndpoint::Close() {
   if (qp_) { ibv_destroy_qp(qp_); qp_ = nullptr; }
   for (auto* m : smr_) if (m) ibv_dereg_mr(m);
   for (auto* m : rmr_) if (m) ibv_dereg_mr(m);
+  for (auto& [addr, m] : user_mr_) if (m) ibv_dereg_mr(m);
+  user_mr_.clear();
   smr_.clear(); rmr_.clear();
   for (auto* b : sbuf_) delete[] b;
   for (auto* b : rbuf_) delete[] b;
@@ -71,7 +73,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   qa.send_cq = cq_; qa.recv_cq = cq_;
   qa.cap.max_send_wr = static_cast<uint32_t>(depth_ + 1);
   qa.cap.max_recv_wr = static_cast<uint32_t>(depth_ + 1);
-  qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 1;
+  qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 2;  // recv may scatter [hdr | payload]
   qa.qp_type = IBV_QPT_RC;
   qa.sq_sig_all = 1;
   qp_ = ibv_create_qp(pd_, &qa);
@@ -171,6 +173,30 @@ bool RcEndpoint::PostSend(size_t slot, size_t len) {
   wr.wr_id = slot; wr.sg_list = &sge; wr.num_sge = 1;
   wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_SIGNALED;
   return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
+  auto key = reinterpret_cast<uintptr_t>(addr);
+  auto it = user_mr_.find(key);
+  if (it != user_mr_.end() && it->second->length >= len) return it->second;
+  if (it != user_mr_.end()) { ibv_dereg_mr(it->second); user_mr_.erase(it); }  // grew
+  ibv_mr* mr = ibv_reg_mr(pd_, addr, len, IBV_ACCESS_LOCAL_WRITE);
+  if (mr) user_mr_[key] = mr;
+  return mr;
+}
+
+bool RcEndpoint::PostRecvScatter(size_t slot, void* payload, size_t payload_len,
+                                 ibv_mr* payload_mr, size_t hdr_bytes) {
+  ibv_sge sge[2]{};
+  sge[0].addr = reinterpret_cast<uintptr_t>(rbuf_[slot]);  // resp prefix + value header
+  sge[0].length = static_cast<uint32_t>(hdr_bytes);
+  sge[0].lkey = rmr_[slot]->lkey;
+  sge[1].addr = reinterpret_cast<uintptr_t>(payload);      // payload -> caller buffer
+  sge[1].length = static_cast<uint32_t>(payload_len);
+  sge[1].lkey = payload_mr->lkey;
+  ibv_recv_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot; wr.sg_list = sge; wr.num_sge = 2;
+  return ibv_post_recv(qp_, &wr, &bad) == 0;
 }
 
 int RcEndpoint::WaitComp(ibv_wc* out, int max) {

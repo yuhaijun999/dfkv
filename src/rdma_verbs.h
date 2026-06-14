@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace dfkv {
@@ -66,6 +67,16 @@ class RcEndpoint {
   bool PostRecv(size_t slot);                          // arm recv into rbuf_[slot]
   bool PostSend(size_t slot, size_t len);              // SEND sbuf_[slot][0,len)
 
+  // Register a caller buffer (e.g. a SGLang HiCache host page) on this PD for
+  // zero-copy receive. Cached by address — HiCache pool buffers are stable so a
+  // buffer registers once and is reused. Returns nullptr on failure.
+  ibv_mr* RegisterUser(void* addr, size_t len);
+  // Scatter recv: first `hdr_bytes` of the message land in rbuf_[slot] (resp
+  // prefix + value header), the remaining payload lands directly in `payload`
+  // (must belong to `payload_mr` from RegisterUser) — zero copy into the caller.
+  bool PostRecvScatter(size_t slot, void* payload, size_t payload_len,
+                       ibv_mr* payload_mr, size_t hdr_bytes);
+
   // Block until at least one completion, drain up to `max` into out[]; returns
   // the count (>0) or <0 on error. wr_id of each wc = the slot. Used for both
   // single round-trips (max=1) and pipelined batches.
@@ -86,6 +97,7 @@ class RcEndpoint {
   size_t cap_ = 0, depth_ = 0;
   std::vector<char*> sbuf_, rbuf_;
   std::vector<ibv_mr*> smr_, rmr_;
+  std::unordered_map<uintptr_t, ibv_mr*> user_mr_;  // cached caller-buffer MRs
   QpInfo local_;
 };
 
