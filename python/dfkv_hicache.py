@@ -40,7 +40,7 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     return lib
 
 
-class DingoFSHiCache(HiCacheStorage):
+class DfkvHiCache(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Optional[dict] = None):
         cfg = (kwargs or {}) or (getattr(storage_config, "extra_config", None) or {})
         self.cfg = cfg

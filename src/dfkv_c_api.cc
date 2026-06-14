@@ -7,8 +7,8 @@
 #include "kv_client.h"
 #include "value_header.h"
 
-using dingofs::cache::kv::KVClient;
-using dingofs::cache::kv::ValueHeader;
+using dfkv::KVClient;
+using dfkv::ValueHeader;
 
 namespace {
 std::vector<std::pair<std::string, std::string>> ParseMembers(const char* s) {

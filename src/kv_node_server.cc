@@ -5,9 +5,7 @@
 #include "net_util.h"
 #include "transport.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir, uint64_t capacity_bytes)
     : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {}
@@ -91,6 +89,4 @@ void KvNodeServer::Handle(int fd) {
   if (!data.empty()) net::WriteAll(fd, data.data(), data.size());
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv

@@ -3,8 +3,8 @@
  * independent KVStore (own LRU); a block is routed to one disk by a second-level
  * Ketama hash on BlockKey.Filename(). Total capacity is split evenly across
  * disks. A single-disk group degenerates to one KVStore. */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_DISK_CACHE_GROUP_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_DISK_CACHE_GROUP_H_
+#ifndef DFKV_DISK_CACHE_GROUP_H_
+#define DFKV_DISK_CACHE_GROUP_H_
 
 #include <cstdint>
 #include <memory>
@@ -16,9 +16,7 @@
 #include "kv_store.h"
 #include "kv_types.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 class DiskCacheGroup {
  public:
@@ -46,8 +44,6 @@ class DiskCacheGroup {
   ConHash ring_;
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_DISK_CACHE_GROUP_H_
+#endif  // DFKV_DISK_CACHE_GROUP_H_

@@ -1,17 +1,15 @@
 /* Compact MD5 (RFC 1321), public-domain style, header-only.
  * Used for deterministic key->id derivation and Ketama ring points so the KV
  * client routing matches dingofs's MD5-based KetamaConHash family. */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_MD5_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_MD5_H_
+#ifndef DFKV_MD5_H_
+#define DFKV_MD5_H_
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 namespace md5detail {
 
 struct Ctx {
@@ -92,8 +90,6 @@ inline uint32_t Md5_32(const std::string& s) {
   return uint32_t(d[0]) | (uint32_t(d[1])<<8) | (uint32_t(d[2])<<16) | (uint32_t(d[3])<<24);
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_MD5_H_
+#endif  // DFKV_MD5_H_

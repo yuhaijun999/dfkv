@@ -2,8 +2,8 @@
  * Python ctypes (Python-version-agnostic; the real build also ships a nanobind
  * module). Pointers are raw host addresses (zero-copy: put reads n bytes from
  * ptr; get writes n bytes to ptr). */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_DFKV_C_API_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_DFKV_C_API_H_
+#ifndef DFKV_DFKV_C_API_H_
+#define DFKV_DFKV_C_API_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -30,4 +30,4 @@ void dfkv_close(dfkv_client_t c);
 }
 #endif
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_DFKV_C_API_H_
+#endif  // DFKV_DFKV_C_API_H_

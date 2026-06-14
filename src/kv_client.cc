@@ -6,9 +6,7 @@
 #include "key_map.h"
 #include "tcp_transport.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                    ValueHeader self_hdr, Transport* transport)
@@ -77,6 +75,4 @@ bool KVClient::Exist(const std::string& key) {
   return e;
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv

@@ -96,7 +96,7 @@ bytes in an `IOBuffer` (zero-copy via `AppendUserData`), and **ignores the `node
 arg** (RemoteBlockCacheImpl re-derives the peer from the BlockKey via the MDS
 PeerGroup Ketama — so client-side `ConHash` is harness-only; pass a single
 placeholder member to `KVClient`). Maps: Put→`SyncCache`, Get→`Range`+`CopyTo`,
-Exist→`Exist`. The value_header / key_map / `dingofs_hicache.py` are reused
+Exist→`Exist`. The value_header / key_map / `dfkv_hicache.py` are reused
 unchanged. (The C-ABI/`libdfkv.so` stays for the ctypes plugin; or build the
 nanobind module below.)
 

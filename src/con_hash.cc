@@ -2,9 +2,7 @@
 
 #include "md5.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 void ConHash::AddNode(const std::string& name, int weight) {
   if (weight < 1) weight = 1;
@@ -39,6 +37,4 @@ bool ConHash::Lookup(const std::string& key, std::string* node) const {
   return true;
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv

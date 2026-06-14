@@ -6,9 +6,7 @@
 
 #include "net_util.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 namespace {
 
@@ -73,6 +71,4 @@ Status TcpTransport::Exist(const std::string& node, const BlockKey& key,
   return st;
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv

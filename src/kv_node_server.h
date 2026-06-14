@@ -2,8 +2,8 @@
  * (one or more NVMe SSDs) and serves Cache/Range/Exist over the TCP wire
  * protocol. The real cache node is dingo-cache (brpc + DiskCache); this proves
  * the semantics end-to-end, including multi-disk intra-node sharding. */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_KV_NODE_SERVER_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_KV_NODE_SERVER_H_
+#ifndef DFKV_KV_NODE_SERVER_H_
+#define DFKV_KV_NODE_SERVER_H_
 
 #include <atomic>
 #include <cstdint>
@@ -14,9 +14,7 @@
 
 #include "disk_cache_group.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 class KvNodeServer {
  public:
@@ -45,8 +43,6 @@ class KvNodeServer {
   std::thread accept_thread_;
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_KV_NODE_SERVER_H_
+#endif  // DFKV_KV_NODE_SERVER_H_

@@ -6,9 +6,7 @@
 
 namespace fs = std::filesystem;
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 const char* StatusName(Status s) {
   switch (s) {
@@ -128,6 +126,4 @@ size_t KVStore::Count() const {
   return index_.size();
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv

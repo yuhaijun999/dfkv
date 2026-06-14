@@ -3,8 +3,8 @@
  * it returns the block is on disk and indexed (IsCached==true), giving the
  * cross-node read-after-write visibility the design requires. Portable (no
  * brpc/io_uring); the real cache node uses the dingofs DiskCache engine. */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_KV_STORE_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_KV_STORE_H_
+#ifndef DFKV_KV_STORE_H_
+#define DFKV_KV_STORE_H_
 
 #include <cstdint>
 #include <list>
@@ -14,9 +14,7 @@
 
 #include "kv_types.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 enum class Status { kOk, kNotFound, kCacheFull, kIOError, kInvalid };
 
@@ -58,8 +56,6 @@ class KVStore {
   uint64_t used_bytes_ = 0;
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_KV_STORE_H_
+#endif  // DFKV_KV_STORE_H_

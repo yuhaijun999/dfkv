@@ -9,16 +9,14 @@
  *
  * Portable (no brpc/MDS deps) so it builds & is unit-tested standalone.
  */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_VALUE_HEADER_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_VALUE_HEADER_H_
+#ifndef DFKV_VALUE_HEADER_H_
+#define DFKV_VALUE_HEADER_H_
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 // CRC32 (IEEE 802.3, poly 0xEDB88320) — same polynomial as zlib's crc32.
 inline uint32_t Crc32(const void* data, size_t len) {
@@ -118,8 +116,6 @@ inline bool HeaderMatches(const ValueHeader& a, const ValueHeader& b) {
   return true;
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_VALUE_HEADER_H_
+#endif  // DFKV_VALUE_HEADER_H_

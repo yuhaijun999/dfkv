@@ -1,15 +1,13 @@
 /* Portable KV types mirroring dingofs BlockKey identity/layout (no brpc deps).
- * In the real build the SDK adapts these to dingofs::BlockKey; the Filename()/
+ * In the real build the SDK adapts these to the production DingoFS BlockKey; the Filename()/
  * StoreKey() formats match src/common/block/block_key.h. */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_KV_TYPES_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_KV_TYPES_H_
+#ifndef DFKV_KV_TYPES_H_
+#define DFKV_KV_TYPES_H_
 
 #include <cstdint>
 #include <string>
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 struct BlockKey {
   uint64_t id = 0;
@@ -30,8 +28,6 @@ struct BlockKey {
   }
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_KV_TYPES_H_
+#endif  // DFKV_KV_TYPES_H_

@@ -1,8 +1,8 @@
 /* Transport abstraction between the KV client and cache nodes.
  * Real build: a brpc-backed impl over dingofs RemoteBlockCache.
  * Test/harness build: TcpTransport (POSIX sockets). */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_TRANSPORT_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_TRANSPORT_H_
+#ifndef DFKV_TRANSPORT_H_
+#define DFKV_TRANSPORT_H_
 
 #include <cstdint>
 #include <string>
@@ -10,9 +10,7 @@
 #include "kv_store.h"   // Status
 #include "kv_types.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 // Wire op codes (shared by TcpTransport and KvNodeServer).
 enum class WireOp : uint8_t { kCache = 1, kRange = 2, kExist = 3 };
@@ -33,8 +31,6 @@ class Transport {
                        bool* exist) = 0;
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_TRANSPORT_H_
+#endif  // DFKV_TRANSPORT_H_

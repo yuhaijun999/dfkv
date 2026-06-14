@@ -1,8 +1,8 @@
 /* Minimal POSIX TCP + little-endian codec helpers for the portable test
  * transport. The real build uses brpc; this is only for the standalone,
  * GPU-free end-to-end harness. */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_NET_UTIL_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_NET_UTIL_H_
+#ifndef DFKV_NET_UTIL_H_
+#define DFKV_NET_UTIL_H_
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -14,9 +14,7 @@
 #include <cstring>
 #include <string>
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 namespace net {
 
 inline bool WriteAll(int fd, const void* buf, size_t n) {
@@ -71,8 +69,6 @@ inline int Dial(const std::string& addr) {
 }
 
 }  // namespace net
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_NET_UTIL_H_
+#endif  // DFKV_NET_UTIL_H_

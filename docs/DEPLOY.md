@@ -87,7 +87,7 @@ n57=192.168.1.57:12000,n59=192.168.1.59:12000
 把插件与库放上 prefill/decode pod 能访问的 hostPath（例 `/alayanew-k8s/mengsz/dfkv/`）：
 ```
 dfkv/libdfkv.so
-dfkv/dingofs_hicache.py        # 来自 src/cache/kvclient/python/
+dfkv/dfkv_hicache.py        # 来自 src/cache/kvclient/python/
 ```
 在**启动 `sglang serve` 之前**注入环境并加后端参数（GLM-5.1 = MLA）：
 ```bash
@@ -98,7 +98,7 @@ sglang serve ... \
   --hicache-mem-layout page_first_direct --hicache-io-backend direct \
   --hicache-storage-backend dynamic \
   --hicache-storage-backend-extra-config '{
-    "backend_name":"dingofs","module_path":"dingofs_hicache","class_name":"DingoFSHiCache",
+    "backend_name":"dingofs","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
     "interface_v1":1,
     "members":"n57=192.168.1.57:12000,n59=192.168.1.59:12000",
     "model_hash": 81, "page_size":64, "dtype_tag":1178092852,

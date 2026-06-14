@@ -6,7 +6,7 @@
 #include <map>
 #include <string>
 
-using dingofs::cache::kv::ConHash;
+using dfkv::ConHash;
 
 TEST(ConHash, EmptyRingReturnsFalse) {
   ConHash ring;

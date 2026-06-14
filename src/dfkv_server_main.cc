@@ -11,8 +11,8 @@
 
 #include "kv_node_server.h"
 
-using dingofs::cache::kv::KvNodeServer;
-using dingofs::cache::kv::Status;
+using dfkv::KvNodeServer;
+using dfkv::Status;
 
 static volatile sig_atomic_t g_stop = 0;
 static void OnSig(int) { g_stop = 1; }

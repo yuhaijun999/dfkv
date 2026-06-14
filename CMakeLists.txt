@@ -40,7 +40,7 @@ install(TARGETS dfkv dfkv_server dfkv_core
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY src/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dfkv FILES_MATCHING PATTERN "*.h")
-install(FILES python/dingofs_hicache.py DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
+install(FILES python/dfkv_hicache.py DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
 
 # --- tests ---
 if(DFKV_BUILD_TESTS)
@@ -65,7 +65,7 @@ if(DFKV_BUILD_TESTS)
   find_program(PYTHON3 python3)
   if(PYTHON3)
     add_test(NAME python_plugin
-      COMMAND ${PYTHON3} -m unittest test_dingofs_hicache
+      COMMAND ${PYTHON3} -m unittest test_dfkv_hicache
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so")

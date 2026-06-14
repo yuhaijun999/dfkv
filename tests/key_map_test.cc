@@ -9,9 +9,9 @@
 #include <set>
 #include <string>
 
-using dingofs::cache::kv::BlockKey;
-using dingofs::cache::kv::ToBlockKey;
-using dingofs::cache::kv::kKvFixedSize;
+using dfkv::BlockKey;
+using dfkv::ToBlockKey;
+using dfkv::kKvFixedSize;
 
 TEST(KeyMap, DeterministicSameKeySameId) {
   EXPECT_EQ(ToBlockKey("glm-5.1/abc123_k").id, ToBlockKey("glm-5.1/abc123_k").id);

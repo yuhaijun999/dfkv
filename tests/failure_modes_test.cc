@@ -12,7 +12,7 @@
 #include <string>
 
 namespace fs = std::filesystem;
-using namespace dingofs::cache::kv;  // NOLINT
+using namespace dfkv;  // NOLINT
 
 namespace {
 ValueHeader Hdr(uint16_t version = ValueHeader::kVersion, uint32_t page = 64) {

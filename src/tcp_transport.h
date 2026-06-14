@@ -1,11 +1,9 @@
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_TCP_TRANSPORT_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_TCP_TRANSPORT_H_
+#ifndef DFKV_TCP_TRANSPORT_H_
+#define DFKV_TCP_TRANSPORT_H_
 
 #include "transport.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 // One short-lived TCP connection per call (simple, correct; the real build
 // uses brpc connection pooling).
@@ -19,8 +17,6 @@ class TcpTransport : public Transport {
                bool* exist) override;
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_TCP_TRANSPORT_H_
+#endif  // DFKV_TCP_TRANSPORT_H_

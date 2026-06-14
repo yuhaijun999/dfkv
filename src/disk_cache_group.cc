@@ -1,8 +1,6 @@
 #include "disk_cache_group.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 DiskCacheGroup::DiskCacheGroup(Options opt) {
   size_t n = opt.cache_dirs.empty() ? 1 : opt.cache_dirs.size();
@@ -55,6 +53,4 @@ size_t DiskCacheGroup::Count() const {
   return t;
 }
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv

@@ -16,7 +16,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using namespace dingofs::cache::kv;  // NOLINT
+using namespace dfkv;  // NOLINT
 
 namespace {
 

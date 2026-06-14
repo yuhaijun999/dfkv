@@ -6,9 +6,9 @@
 #include <cstring>
 #include <string>
 
-using dingofs::cache::kv::ValueHeader;
-using dingofs::cache::kv::Crc32;
-using dingofs::cache::kv::HeaderMatches;
+using dfkv::ValueHeader;
+using dfkv::Crc32;
+using dfkv::HeaderMatches;
 
 namespace {
 

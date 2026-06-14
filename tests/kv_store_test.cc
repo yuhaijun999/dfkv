@@ -6,9 +6,9 @@
 #include <filesystem>
 #include <string>
 
-using dingofs::cache::kv::BlockKey;
-using dingofs::cache::kv::KVStore;
-using dingofs::cache::kv::Status;
+using dfkv::BlockKey;
+using dfkv::KVStore;
+using dfkv::Status;
 
 namespace fs = std::filesystem;
 

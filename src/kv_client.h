@@ -4,8 +4,8 @@
  *  - Put  -> SyncCache (durable-visible write, header-wrapped)
  *  - Get  -> Range + header/CRC verify (mismatch or corruption => miss)
  *  - Exist-> local existence check on the owning node */
-#ifndef DINGOFS_SRC_CACHE_KVCLIENT_KV_CLIENT_H_
-#define DINGOFS_SRC_CACHE_KVCLIENT_KV_CLIENT_H_
+#ifndef DFKV_KV_CLIENT_H_
+#define DFKV_KV_CLIENT_H_
 
 #include <map>
 #include <memory>
@@ -17,9 +17,7 @@
 #include "transport.h"
 #include "value_header.h"
 
-namespace dingofs {
-namespace cache {
-namespace kv {
+namespace dfkv {
 
 class KVClient {
  public:
@@ -42,8 +40,6 @@ class KVClient {
   Transport* t_;
 };
 
-}  // namespace kv
-}  // namespace cache
-}  // namespace dingofs
+}  // namespace dfkv
 
-#endif  // DINGOFS_SRC_CACHE_KVCLIENT_KV_CLIENT_H_
+#endif  // DFKV_KV_CLIENT_H_

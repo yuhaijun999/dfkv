@@ -23,7 +23,7 @@ BUILD = os.environ.get("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 SERVER_BIN = os.path.join(BUILD, "dfkv_server")
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  # noqa: E402
-import dingofs_hicache  # noqa: E402  (RED until implemented)
+import dfkv_hicache  # noqa: E402  (RED until implemented)
 
 
 class FakeMlaPool:
@@ -110,7 +110,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
             })
 
     def _plugin(self, cfg, pool):
-        st = dingofs_hicache.DingoFSHiCache(cfg, cfg.extra_config)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
         st.register_mem_pool_host(pool)
         return st
 

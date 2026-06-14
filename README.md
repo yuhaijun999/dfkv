@@ -18,12 +18,12 @@ shared, large-capacity KVCache pool for LLM inference (e.g. GLM-5.1 / MLA),
   Supports **multiple NVMe SSDs per node** (`--dir d1,d2,d3`, intra-node Ketama).
 - **`libdfkv.so`** — C ABI client (key→consistent-hash routing, value header with
   CRC + model/page/dtype/layer geometry guard, Put/Get/Exist).
-- **`python/dingofs_hicache.py`** — SGLang `HiCacheStorage` plugin loaded via
+- **`python/dfkv_hicache.py`** — SGLang `HiCacheStorage` plugin loaded via
   `--hicache-storage-backend dynamic` (no SGLang fork). MLA: one packed-latent
   object per page, no tp_rank suffix, `backup_skip` (only tp_rank 0 writes).
 
 ## Design in one breath
-SGLang HiCache (zero-copy v1) → `dingofs_hicache.py` (ctypes) → `libdfkv` client
+SGLang HiCache (zero-copy v1) → `dfkv_hicache.py` (ctypes) → `libdfkv` client
 (Ketama route + header wrap/verify) → TCP → `dfkv_server` (DiskCacheGroup over
 N NVMe, LRU). Membership is a **static list** of node addresses (no MDS).
 Distributed = client-side consistent hashing; no replication (regenerable KV →
@@ -48,7 +48,7 @@ Full rollout runbook: `docs/DEPLOY.md`.
 ## Layout
 ```
 src/        portable C++ core (headers + .cc) + dfkv_server_main.cc
-python/     dingofs_hicache.py  (SGLang dynamic backend plugin)
+python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
 tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
 docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-cache)
 ```
