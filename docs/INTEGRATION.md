@@ -1,10 +1,17 @@
-# Full-build brpc integration guide (`feat/kvcache-sglang`)
+# Optional: fuse dfkv semantics into production dingo-cache (brpc + MDS)
 
-The portable core (this dir) is compiled & tested standalone. To wire it into the
-production `dingo-cache` (brpc + MDS + DiskCache) apply the following in the full
-dingofs build. Line refs are from the analysis on `main`/v5.1; re-confirm on the
-build tag. **Compile in the full toolchain (gcc-13 / cmake-3.30 / dingo-eureka),
-not in the standalone harness.**
+> **Status — read first.** The primary, supported way to run dfkv is the
+> **standalone repo** with its own daemon + native-verbs RDMA transport
+> (`dfkv_server`, see `docs/DEPLOY.md`). It is feature-complete and validated on
+> 400G. This document is an **optional, aspirational** guide for an alternative
+> path: re-implementing the same Cache/Range/Exist semantics *inside* the
+> production `dingo-cache` (brpc + MDS + DiskCache) so HiCache could talk to the
+> existing cache fleet over brpc instead of dfkv_server. It is **not required**
+> for deployment and parts may be stale — re-confirm line refs on the build tag.
+> Most users want `DEPLOY.md`, not this.
+
+To wire the semantics into the full dingofs build, apply the following.
+**Compile in the full toolchain (gcc-13 / cmake-3.30 / dingo-eureka).**
 
 ## 1. proto (DONE on this branch)
 `proto/dingofs/blockcache.proto`: added `ExistRequest/ExistResponse`,
