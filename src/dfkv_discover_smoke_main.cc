@@ -22,6 +22,7 @@
 
 #include "kv_client.h"
 #include "value_header.h"
+#include "version.h"
 
 using dfkv::KVClient;
 using dfkv::ValueHeader;
@@ -37,6 +38,7 @@ static std::vector<std::string> SplitComma(const std::string& s) {
 }
 
 int main(int argc, char** argv) {
+  if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_discover_smoke %s\n", dfkv::Version()); return 0; }
   std::string mds_arg;
   std::string group   = "default";
   int         count   = 200;

@@ -16,6 +16,7 @@
 #include "log.h"
 #include "mds_registrar.h"
 #include "metrics_http.h"
+#include "version.h"
 #ifdef DFKV_WITH_RDMA
 #include "rdma_server.h"
 #endif
@@ -27,6 +28,7 @@ static volatile sig_atomic_t g_stop = 0;
 static void OnSig(int) { g_stop = 1; }
 
 int main(int argc, char** argv) {
+  if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_server %s\n", dfkv::Version()); return 0; }
   std::string dir = "/tmp/dfkv_node";
   std::string rdma_dev, mds, group = "default", node_id, advertise;
   int weight = 1;

@@ -8,6 +8,7 @@
 
 #include "kv_client.h"
 #include "value_header.h"
+#include "version.h"
 
 using namespace dfkv;  // NOLINT
 
@@ -27,6 +28,7 @@ static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::
 }
 
 int main(int argc, char** argv) {
+  if (WantsVersion(argc, argv)) { std::printf("dfkv_smoke %s\n", Version()); return 0; }
   std::string members;
   size_t size = 4096;
   for (int i = 1; i + 1 < argc; i += 2) {

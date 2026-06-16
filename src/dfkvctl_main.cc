@@ -20,6 +20,7 @@
 #include "prom_parse.h"
 #include "tcp_transport.h"
 #include "value_header.h"
+#include "version.h"
 
 using namespace dfkv;  // NOLINT
 
@@ -116,6 +117,7 @@ static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::
 }
 
 int main(int argc, char** argv) {
+  if (WantsVersion(argc, argv)) { std::printf("dfkvctl %s\n", Version()); return 0; }
   std::string members;
   uint64_t model_hash = 0x51;
   uint32_t page = 64, dtype = 0x46384534u, layer = 78, head = 1, hd = 576, tps = 8, tpr = 0, mla = 1;

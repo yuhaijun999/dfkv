@@ -25,6 +25,7 @@
 #include "kv_client.h"
 #include "transport_factory.h"
 #include "value_header.h"
+#include "version.h"
 
 using namespace dfkv;  // NOLINT
 using Clock = std::chrono::steady_clock;
@@ -84,6 +85,7 @@ static void Report(const char* phase, size_t count, size_t size, size_t threads,
 }
 
 int main(int argc, char** argv) {
+  if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_bench %s\n", dfkv::Version()); return 0; }
   std::string members, op = "both";
   size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
   for (int i = 1; i + 1 < argc; i += 2) {

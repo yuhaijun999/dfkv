@@ -8,6 +8,7 @@
 
 #include "mds_server.h"
 #include "metrics_http.h"
+#include "version.h"
 
 namespace {
 volatile sig_atomic_t g_stop = 0;
@@ -15,6 +16,7 @@ void OnSig(int) { g_stop = 1; }  // async-signal-safe: just set a flag
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_mds %s\n", dfkv::Version()); return 0; }
   std::string etcd = "127.0.0.1:2379";
   int port = 0, metrics_port = -1;
   for (int i = 1; i + 1 < argc; i += 2) {

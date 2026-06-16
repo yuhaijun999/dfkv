@@ -2,6 +2,15 @@
 # Integration smoke for dfkv_server + dfkv_smoke + dfkvctl. arg1 = build dir.
 set -e
 BUILD="${1:?build dir}"
+
+# --version: each binary prints its name + a version string and exits 0 (must NOT
+# fall through to running the daemon).
+for b in dfkv_server dfkv_mds dfkvctl dfkv_bench dfkv_smoke; do
+  out=$("$BUILD/$b" --version)
+  echo "$out" | grep -qE "^$b [0-9]+\.[0-9]+" || { echo "$b --version bad: '$out'"; exit 1; }
+done
+echo "version smoke OK"
+
 D=$(mktemp -d)
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
 "$BUILD/dfkv_server" --dir "$D" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
