@@ -44,6 +44,7 @@ class KvNodeServer {
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
   size_t DiskCount() const { return group_.DiskCount(); }
   size_t AcceptCount() const { return accept_count_.load(std::memory_order_relaxed); }
+  size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
 
   // metrics (relaxed atomics)
   size_t m_cache_put() const { return cache_put_.load(std::memory_order_relaxed); }
@@ -81,6 +82,7 @@ class KvNodeServer {
  private:
   void AcceptLoop();
   void Handle(int fd);
+  void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
@@ -100,10 +102,16 @@ class KvNodeServer {
   std::atomic<size_t> accept_count_{0};
   std::thread accept_thread_;
   // connection drain: track per-connection handler threads + their fds so Stop()
-  // can unblock (shutdown) and join them before group_ is destroyed.
+  // can unblock (shutdown) and join them before group_ is destroyed. Finished
+  // handlers are reaped incrementally at accept time (done flag), so a long-lived
+  // node with churning clients doesn't accumulate dead thread handles.
+  struct Conn {
+    std::thread th;
+    std::shared_ptr<std::atomic<bool>> done;
+  };
   std::mutex conn_mu_;
   std::set<int> conn_fds_;
-  std::vector<std::thread> conn_threads_;
+  std::vector<Conn> conns_;
 };
 
 }  // namespace dfkv

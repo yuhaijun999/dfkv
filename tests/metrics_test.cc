@@ -1,9 +1,14 @@
 // TDD R11 — server metrics counters + Prometheus text + remote Stats op.
 #include "kv_node_server.h"
 #include "key_map.h"
+#include "net_util.h"
 #include "tcp_transport.h"
 
 #include <gtest/gtest.h>
+
+#include <chrono>
+#include <thread>
+#include <unistd.h>
 
 #include <filesystem>
 #include <memory>
@@ -109,6 +114,31 @@ TEST(Metrics, OpenConnectionsTracksLiveConn) {
     // a connection is open while the pooled fd lives
     EXPECT_NE(s->MetricsText().find("dfkv_open_connections"), std::string::npos);
   }  // transport destructor closes the pooled fd; server-side handler exits
+  s->Stop();
+}
+
+TEST(Metrics, ReapsConnHandlerThreads) {
+  // Short-lived client connections (connect + immediate close) each spawn a
+  // handler thread that exits on peer-close. Reaping at accept time must keep the
+  // unreaped handler-thread list bounded, not growing ~1 per connection.
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_reap";
+  auto s = Start(dir, &addr);
+  for (int i = 0; i < 80; ++i) {
+    int fd = net::Dial(addr, 1000, 1000);
+    ASSERT_GE(fd, 0);
+    ::close(fd);  // peer close -> handler's ReadAll fails -> handler exits
+  }
+  // Reaping fires on accept; nudge a few more + poll until it drains.
+  size_t live = 999;
+  for (int r = 0; r < 40; ++r) {
+    int fd = net::Dial(addr, 1000, 1000);
+    if (fd >= 0) ::close(fd);
+    live = s->live_conn_count();
+    if (live <= 5) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_LE(live, 5u) << "conn handler threads not reaped";
   s->Stop();
 }
 

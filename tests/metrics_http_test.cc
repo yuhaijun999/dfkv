@@ -56,6 +56,22 @@ TEST(MetricsHttp, ServesMetricsHealthzAnd404) {
   srv.Stop();
 }
 
+TEST(MetricsHttp, ReapsHandlerThreadsAcrossScrapes) {
+  // Prometheus scrapes are Connection: close — one connection per scrape. Without
+  // reaping, the handler-thread list grew unbounded. After many sequential
+  // scrapes the live (unreaped) count must stay small, not ~N.
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int port = srv.port();
+  for (int i = 0; i < 60; ++i) {
+    std::string m = HttpGet(port, "/metrics");
+    EXPECT_NE(m.find("dfkv_x 1"), std::string::npos);
+  }
+  // accept-time reaping joins finished handlers; allow a tiny in-flight slack.
+  EXPECT_LE(srv.live_conn_count(), 3u) << "handler threads not reaped";
+  srv.Stop();
+}
+
 TEST(MetricsHttp, StopIsIdempotent) {
   MetricsHttpServer srv([] { return std::string("x 1\n"); });
   ASSERT_EQ(srv.Start(0), Status::kOk);

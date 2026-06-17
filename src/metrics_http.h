@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -30,10 +31,23 @@ class MetricsHttpServer {
   Status Start(int port);  // port 0 => ephemeral; query with port()
   void Stop();             // idempotent
   int port() const { return port_; }
+  // Handler threads not yet reaped (test/diagnostic). Bounded under scrape churn
+  // now that finished connections are joined as new ones arrive — Prometheus
+  // scrapes are Connection: close, so without reaping this grew per scrape.
+  size_t live_conn_count();
 
  private:
   void AcceptLoop();
   void Handle(int fd);
+  void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
+
+  // A live connection: its handler thread + a flag the thread sets last, so
+  // AcceptLoop can join it without blocking. shared_ptr because conns_ may
+  // reallocate; the thread captures its own copy.
+  struct Conn {
+    std::thread th;
+    std::shared_ptr<std::atomic<bool>> done;
+  };
 
   std::function<std::string()> render_;
   int listen_fd_ = -1;
@@ -42,7 +56,7 @@ class MetricsHttpServer {
   std::thread accept_thread_;
   std::mutex conn_mu_;
   std::set<int> conn_fds_;
-  std::vector<std::thread> conn_threads_;
+  std::vector<Conn> conns_;
 };
 
 }  // namespace dfkv

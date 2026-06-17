@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,12 +31,14 @@ class MdsServer {
   void Stop();
   int port() const { return port_; }
   std::string MetricsText() const { return metrics_.Render(); }
+  size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
 
   static constexpr int kTtlSeconds = 30;
 
  private:
   void AcceptLoop();
   void Handle(int fd);
+  void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   Status Upsert(const std::string& group, const MemberInfo& m);
   Status ListMembers(const std::string& group, std::string* out);
   static std::string MemberKey(const std::string& group, const std::string& id);
@@ -46,9 +49,13 @@ class MdsServer {
   int listen_fd_ = -1;
   int port_ = 0;
   std::thread accept_thread_;
+  struct Conn {
+    std::thread th;
+    std::shared_ptr<std::atomic<bool>> done;
+  };
   std::mutex conn_mu_;
   std::vector<int> conn_fds_;
-  std::vector<std::thread> conn_threads_;
+  std::vector<Conn> conns_;
   std::mutex lease_mu_;
   std::map<std::string, int64_t> leases_;
   MdsMetrics metrics_;

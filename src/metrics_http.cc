@@ -42,14 +42,30 @@ void MetricsHttpServer::Stop() {
   if (accept_thread_.joinable()) accept_thread_.join();
   if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
   std::vector<int> fds;
-  std::vector<std::thread> threads;
+  std::vector<Conn> conns;
   {
     std::lock_guard<std::mutex> lk(conn_mu_);
     fds.assign(conn_fds_.begin(), conn_fds_.end());
-    threads.swap(conn_threads_);
+    conns.swap(conns_);
   }
   for (int fd : fds) ::shutdown(fd, SHUT_RDWR);
-  for (auto& t : threads) if (t.joinable()) t.join();
+  for (auto& c : conns) if (c.th.joinable()) c.th.join();
+}
+
+void MetricsHttpServer::ReapDoneLocked() {
+  for (auto it = conns_.begin(); it != conns_.end();) {
+    if (it->done->load(std::memory_order_acquire)) {
+      if (it->th.joinable()) it->th.join();
+      it = conns_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+size_t MetricsHttpServer::live_conn_count() {
+  std::lock_guard<std::mutex> lk(conn_mu_);
+  return conns_.size();
 }
 
 void MetricsHttpServer::AcceptLoop() {
@@ -57,12 +73,17 @@ void MetricsHttpServer::AcceptLoop() {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
     std::lock_guard<std::mutex> lk(conn_mu_);
+    if (!running_) { ::close(fd); break; }
+    ReapDoneLocked();  // join finished scrape handlers (Connection: close => one per scrape)
     conn_fds_.insert(fd);
-    conn_threads_.emplace_back([this, fd] {
-      Handle(fd);
-      { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
-      ::close(fd);
-    });
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    conns_.push_back({std::thread([this, fd, done] {
+                        Handle(fd);
+                        { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
+                        ::close(fd);
+                        done->store(true, std::memory_order_release);  // last act
+                      }),
+                      done});
   }
 }
 
