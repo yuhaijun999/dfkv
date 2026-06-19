@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dfkv-vllm"
+version = "0.1.0"
+description = "Direct vLLM KVConnectorBase_V1 connector for dfkv (GPUDirect RDMA, no LMCache)"
+requires-python = ">=3.12"
+# vllm + torch are provided by the runtime image; not pinned here. The connector
+# itself is pure Python (ctypes over libdfkv.so), so there is no native build.
+
+[tool.setuptools.packages.find]
+where = ["src"]

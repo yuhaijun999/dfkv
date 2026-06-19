@@ -1,0 +1,1290 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# The transfer-thread scaffolding (KVTransferThread, KVCacheStoreSendingThread,
+# KVCacheStoreRecvingThread) is adapted from vllm-project/vllm-ascend
+# (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
+"""Worker-side logic for DfkvStoreConnector.
+
+Includes the store worker, transfer threads, lookup server, and
+DfkvDeviceClient integration. The DfkvDeviceClient drives libdfkv.so over
+GPUDirect RDMA; the storage backend is dfkv rather than a Mooncake store, so
+Mooncake-store-only features (replica-tier classification, owner-DirectIO disk
+offload staging, ReplicateConfig/preferred_segment) are dropped.
+"""
+
+import dataclasses
+import os
+import queue
+import socket
+import threading
+import time
+from collections import defaultdict
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+import torch
+import zmq
+
+import vllm.envs as envs
+from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_dcp_group,
+    get_pcp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.distributed.kv_events import BlockStored
+from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    maybe_convert_block_hash,
+    resolve_kv_cache_block_sizes,
+)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+# dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
+# dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
+from .coordinator import (
+    ExternalCachedBlockPool,
+    DfkvStoreCoordinator,
+)
+from .data import (
+    ChunkedTokenDatabase,
+    KeyMetadata,
+    DfkvStoreConnectorMetadata,
+    PoolKey,
+    ReqMeta,
+)
+from .dfkv_client import DfkvDeviceClient
+from .dfkv_utils import get_dp_engine_index
+from .metrics import DfkvStoreConnectorStats
+from .protocol import (
+    LOOKUP_MSG,
+    RESET_MSG,
+    RESP_ERR,
+    RESP_OK,
+)
+
+logger = init_logger(__name__)
+
+_T = TypeVar("_T")
+
+
+def _rotate_list(values: list[_T], offset: int) -> list[_T]:
+    return values[offset:] + values[:offset]
+
+
+def _sum_batch_bytes(sizes: list[list[int]]) -> int:
+    return sum(sum(size) for size in sizes)
+
+
+# dfkv: Removed Mooncake-store-only helpers:
+#   * disk-offload staging budget math (_align_up,
+#     _estimate_disk_offload_staging_bytes, _get_usable_disk_offload_buffer
+#     _budget_bytes, _split_disk_offload_load_batches) -- dfkv has no
+#     owner-side DirectIO staging budget, so a GET is issued as one batch.
+#   * replica-tier classification (_call_replica_predicate,
+#     _classify_replica_tier, _get_replica_tiers_by_key,
+#     _log_mooncake_load_tier_summary) -- dfkv has no batch_get_replica_desc /
+#     memory-vs-disk replica tiers.
+#   * MooncakeStoreConfig / _parse_size / MooncakeMode and the NO_AVAILABLE
+#     _HANDLE pressure code -- dfkv is configured via kv_connector_extra_config
+#     and has no embedded/standalone-store topology or offload pressure signal.
+
+
+# dfkv: batch_put returns a per-key rc (0 == ok, non-zero == failure); a GET
+# returns (hits, lens) with hit in {0, 1}. These helpers normalize the two
+# dfkv return shapes into the (failed-index list) shape the threads expect.
+def _put_failed_indices(rcs: list[int]) -> list[int]:
+    return [i for i, rc in enumerate(rcs) if rc != 0]
+
+
+# ============================================================
+# Transfer Threads
+# ============================================================
+
+
+class KVTransferThread(threading.Thread):
+    """Base class for async KV cache transfer threads."""
+
+    def __init__(
+        self,
+        client: Any,
+        token_databases: list[ChunkedTokenDatabase],
+        block_size: int,
+        tp_rank: int,
+        ready_event: threading.Event,
+        name: str,
+        record_operation: Callable[..., None] | None = None,
+    ):
+        super().__init__(daemon=True, name=name)
+        self.client = client
+        self.ready_event = ready_event
+        self.block_size = block_size
+        self.tp_rank = tp_rank
+        self.token_databases = token_databases
+        self._record_operation_cb = record_operation
+        self.done_task_lock = threading.Lock()
+        self.request_queue: queue.Queue[Any] = queue.Queue()
+        self.finished_requests: set[str] = set()
+        self.kv_event_lock = threading.Lock()
+        self.kv_events: list[BlockStored] = []
+
+    def add_request(self, request: ReqMeta) -> None:
+        self.request_queue.put(request)
+
+    def get_and_clear_finished_requests(self) -> set[str]:
+        with self.done_task_lock:
+            finished = self.finished_requests.copy()
+            self.finished_requests.clear()
+        return finished
+
+    def set_finished_request(self, req_id: str):
+        with self.done_task_lock:
+            self.finished_requests.add(req_id)
+
+    def run(self):
+        self.ready_event.set()
+        while True:
+            try:
+                request_data = self.request_queue.get()
+                if request_data is None:
+                    logger.warning("Received a None request!")
+                    self.request_queue.task_done()
+                    continue
+                self._handle_request(request_data)
+            except Exception as e:
+                logger.error("Error in %s: %s", self.name, e)
+
+    def _handle_request(self, req_meta: Any):
+        pass
+
+    def _record_operation(
+        self,
+        operation: str,
+        start_time: float,
+        num_keys: int,
+        *,
+        num_bytes: int = 0,
+        status: str = "ok",
+        num_failed_keys: int = 0,
+    ) -> None:
+        if self._record_operation_cb is None:
+            return
+        self._record_operation_cb(
+            operation=operation,
+            duration_seconds=time.perf_counter() - start_time,
+            num_keys=num_keys,
+            num_bytes=num_bytes,
+            status=status,
+            num_failed_keys=num_failed_keys,
+        )
+
+    def update_kv_event(self, events: list[BlockStored]):
+        with self.kv_event_lock:
+            self.kv_events.extend(events)
+
+    def get_kv_events(self) -> list[BlockStored]:
+        with self.kv_event_lock:
+            events = self.kv_events.copy()
+            self.kv_events.clear()
+        return events
+
+
+class KVCacheStoreSendingThread(KVTransferThread):
+    """Background thread for storing KV cache blocks to the store."""
+
+    def __init__(
+        self,
+        client: Any,
+        coord: DfkvStoreCoordinator,
+        token_databases: list[ChunkedTokenDatabase],
+        block_size: int,
+        tp_rank: int,
+        put_step: int,
+        kv_role: str,
+        ready_event: threading.Event,
+        enable_kv_event: bool = False,
+        record_operation: Callable[..., None] | None = None,
+    ):
+        super().__init__(
+            client,
+            token_databases,
+            block_size,
+            tp_rank,
+            ready_event,
+            name="KVCacheStoreSendingThread",
+            record_operation=record_operation,
+        )
+        self.put_step = put_step
+        self.coord = coord
+        self.kv_role = kv_role
+        self.stored_requests: defaultdict[str, int] = defaultdict(int)
+        self.enable_kv_event = enable_kv_event
+
+    def add_stored_request(self, req_id: str):
+        with self.done_task_lock:
+            self.stored_requests[req_id] += 1
+
+    def dec_stored_request(self, req_id: str):
+        with self.done_task_lock:
+            if req_id in self.stored_requests:
+                self.stored_requests[req_id] -= 1
+
+    def delete_finished_stored_request(self, req_id: str):
+        with self.done_task_lock:
+            if req_id in self.stored_requests:
+                del self.stored_requests[req_id]
+
+    def _handle_request(self, req_meta: ReqMeta):
+        # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
+        # is also ``store_mask``'s precondition.
+        lcm_block_size = self.coord.lcm_block_size
+        token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
+        block_ids_per_group = req_meta.block_ids
+        req_id = req_meta.req_id
+        current_event = req_meta.current_event
+
+        if req_id not in self.stored_requests:
+            self.request_queue.task_done()
+            return
+
+        # Decrement the in-flight counter and signal task_done() in `finally`
+        # so the scheduler can release the GPU blocks it pinned for this
+        # request (via `delay_free_blocks`) even when the store path raises.
+        try:
+            if token_len == 0:
+                return
+
+            # Within each lcm region only per-spec relevant chunks are loaded
+            # (e.g., SWA or linear attn), so mask out irrelevant chunks
+            store_masks = self.coord.store_mask(token_len)
+            starts: list[int] = []
+            ends: list[int] = []
+            keys: list[str] = []
+            block_hashes: list[BlockHash] = []
+            group_indices: list[int] = []
+            for g_idx, db in enumerate(self.token_databases):
+                mask = store_masks[g_idx]
+                for chunk_idx, (start, end, key) in enumerate(
+                    db.process_tokens(token_len, req_meta.block_hashes)
+                ):
+                    if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                        continue
+                    starts.append(start)
+                    ends.append(end)
+                    keys.append(key.to_string())
+                    block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
+                    group_indices.append(g_idx)
+
+            # Apply put_step striding for TP
+            sl = slice(self.tp_rank % self.put_step, None, self.put_step)
+            starts = starts[sl]
+            ends = ends[sl]
+            keys = keys[sl]
+            block_hashes = block_hashes[sl]
+            group_indices = group_indices[sl]
+
+            if not keys:
+                return
+
+            # Check which blocks already exist (dedup)
+            save_exists_start = time.perf_counter()
+            try:
+                exists_states = self.client.batch_exist(keys)
+            except Exception:
+                self._record_operation(
+                    "save_exists",
+                    save_exists_start,
+                    len(keys),
+                    status="error",
+                    num_failed_keys=len(keys),
+                )
+                raise
+            self._record_operation(
+                "save_exists",
+                save_exists_start,
+                len(keys),
+            )
+            missing_indices = [
+                i for i, exists in enumerate(exists_states) if exists != 1
+            ]
+
+            if not missing_indices:
+                return
+
+            starts = [starts[i] for i in missing_indices]
+            ends = [ends[i] for i in missing_indices]
+            keys = [keys[i] for i in missing_indices]
+            block_hashes = [block_hashes[i] for i in missing_indices]
+            group_indices = [group_indices[i] for i in missing_indices]
+
+            logger.debug(
+                "Storing KV cache for %d blocks (groups=%s) for request %s",
+                len(keys),
+                set(group_indices),
+                req_id,
+            )
+
+            addrs: list[list[int]] = []
+            sizes: list[list[int]] = []
+            stored_events: list[BlockStored] = []
+            # parent_block_hash chains live within a group, not across.
+            prev_key_per_group: dict[int, Any] = {}
+            new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
+
+            for idx, (s, e, g_idx) in enumerate(
+                zip(starts, ends, group_indices, strict=True)
+            ):
+                db = self.token_databases[g_idx]
+                addr, size, _ = db.prepare_value(s, e, block_ids_per_group[g_idx])
+                addrs.append(addr)
+                sizes.append(size)
+
+                if self.enable_kv_event:
+                    token_ids = (
+                        req_meta.token_ids[s:e]
+                        if req_meta.token_ids is not None
+                        else None
+                    )
+                    stored_event = BlockStored(
+                        block_hashes=[new_block_hashes[idx]],
+                        parent_block_hash=prev_key_per_group.get(g_idx),
+                        token_ids=token_ids,
+                        block_size=db.block_size,
+                        lora_id=None,
+                        medium="cpu",
+                        lora_name=None,
+                        group_idx=g_idx,
+                    )
+                    stored_events.append(stored_event)
+                    prev_key_per_group[g_idx] = new_block_hashes[idx]
+
+            if current_event is not None:
+                current_event.synchronize()
+
+            # dfkv: coalesce each chunk's per-layer segments (addrs[i]/sizes[i])
+            # into ONE dfkv key via scatter-gather (<=29 segs/key on max_sge=30),
+            # suffixed "@sg{n}" -- one RDMA multi-SGE op + one server blob per key
+            # instead of one tiny key per segment. This cuts the key count ~20x
+            # (25392 -> ~1242) so the load is bandwidth-bound, not per-key-bound.
+            sg_keys, sg_ptrs, sg_sizes, _ = _group_segments_sg(keys, addrs, sizes)
+            batch_bytes = sum(sum(s) for s in sg_sizes)
+            put_start = time.perf_counter()
+            try:
+                res = self.client.batch_put_sg(sg_keys, sg_ptrs, sg_sizes)
+                failed = _put_failed_indices(res)
+                self._record_operation(
+                    "save_put",
+                    put_start,
+                    len(sg_keys),
+                    num_bytes=batch_bytes,
+                    status="partial_failure" if failed else "ok",
+                    num_failed_keys=len(failed),
+                )
+                logger.debug(
+                    "dfkv save_put: keys=%d bytes=%d ms=%.1f failed=%d",
+                    len(sg_keys), batch_bytes,
+                    (time.perf_counter() - put_start) * 1000.0, len(failed),
+                )
+                if failed:
+                    failed_codes = set(res[i] for i in failed)
+                    # dfkv: write failure is non-fatal -- count + drop this
+                    # request's save; dfkv's peer-health marks the bad peer and
+                    # short-circuits. Never block inference.
+                    logger.warning(
+                        "batch_put_sg failed: %d/%d keys failed "
+                        "(codes=%s, batch_bytes=%d), first_key=%s",
+                        len(failed),
+                        len(sg_keys),
+                        failed_codes,
+                        batch_bytes,
+                        sg_keys[0] if sg_keys else "N/A",
+                    )
+            except Exception as e:
+                self._record_operation(
+                    "save_put",
+                    put_start,
+                    len(flat_keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(flat_keys),
+                )
+                logger.error("Failed to put key %s, error: %s", flat_keys, e)
+
+            if self.enable_kv_event and stored_events:
+                self.update_kv_event(stored_events)
+        finally:
+            self.dec_stored_request(req_id)
+            self.request_queue.task_done()
+
+
+class KVCacheStoreRecvingThread(KVTransferThread):
+    """Background thread for loading KV cache blocks from the store."""
+
+    def __init__(
+        self,
+        client: Any,
+        coord: DfkvStoreCoordinator,
+        token_databases: list[ChunkedTokenDatabase],
+        block_size: int,
+        tp_rank: int,
+        ready_event: threading.Event,
+        record_operation: Callable[..., None] | None = None,
+    ):
+        super().__init__(
+            client,
+            token_databases,
+            block_size,
+            tp_rank,
+            ready_event,
+            name="KVCacheStoreRecvingThread",
+            record_operation=record_operation,
+        )
+        # _invalid_block_ids can be access by both the Worker and RecvingThread
+        self._invalid_block_ids_lock = threading.Lock()
+        self._invalid_block_ids: set[int] = set()
+        self.coord = coord
+
+    def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
+        with self._invalid_block_ids_lock:
+            self._invalid_block_ids.update(block_ids)
+
+    def get_and_clear_block_ids_with_load_errors(self) -> set[int]:
+        with self._invalid_block_ids_lock:
+            invalid_block_ids = self._invalid_block_ids.copy()
+            self._invalid_block_ids.clear()
+        return invalid_block_ids
+
+    def _handle_request(self, req_meta: ReqMeta):
+        token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
+        req_id = req_meta.req_id
+        mask_num = (
+            req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
+            // self.block_size
+            * self.block_size
+        )
+
+        # Skip chunks the consumer's per-group spec wouldn't populate
+        # locally (e.g. SWA pre-window) even if the producer stored them.
+        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+
+        addr_list: list[list[int]] = []
+        size_list: list[list[int]] = []
+        key_list: list[str] = []
+        block_id_list: list[int] = []
+        for g_idx, db in enumerate(self.token_databases):
+            mask = load_mask_per_group[g_idx]
+            for start, end, key in db.process_tokens(
+                token_len, req_meta.block_hashes, mask_num
+            ):
+                chunk_idx = start // db.block_size
+                if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                    continue
+                addr, size, block_id = db.prepare_value(
+                    start, end, req_meta.block_ids[g_idx]
+                )
+                key_list.append(key.to_string())
+                addr_list.append(addr)
+                size_list.append(size)
+                block_id_list.append(block_id)
+
+        # Rotate aligned lists by tp_rank for load balancing.
+        rotation = self.tp_rank % len(key_list)
+        key_list_c = _rotate_list(key_list, rotation)
+        addr_list_c = _rotate_list(addr_list, rotation)
+        size_list_c = _rotate_list(size_list, rotation)
+        block_id_list_c = _rotate_list(block_id_list, rotation)
+
+        # dfkv: A GET is one batch -- dfkv has no owner-side DirectIO staging
+        # budget, so the Mooncake disk-offload sub-batch split is dropped.
+        # Flatten per-key scatter-gather to one (ptr, cap) per dfkv key, then
+        # map each flattened result back to its originating block id for error
+        # reporting (see _flatten_segments / seg_owner).
+        sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
+            key_list_c, addr_list_c, size_list_c
+        )
+        sg_totals = [sum(c) for c in sg_caps]
+        batch_bytes = sum(sg_totals)
+
+        load_get_start = time.perf_counter()
+        try:
+            # dfkv: one scatter-gather GET per coalesced key -> (hits, lens). The
+            # server returns one blob; the RDMA recv SGE list scatters it back
+            # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
+            # means the chunk loaded; a miss or short read marks the originating
+            # block as a load error so vLLM recomputes that span (never fatal).
+            hits, lens = self.client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
+            failed_block_ids: list[int] = []
+            failed_detail: list[tuple[str, int]] = []
+            for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
+                if hit != 1 or got_len < sg_totals[i]:
+                    failed_block_ids.append(block_id_list_c[sg_owner[i]])
+                    failed_detail.append((sg_keys[i], hit))
+            self._record_operation(
+                "load_get",
+                load_get_start,
+                len(sg_keys),
+                num_bytes=batch_bytes,
+                status="partial_failure" if failed_block_ids else "ok",
+                num_failed_keys=len(failed_block_ids),
+            )
+            logger.debug(
+                "dfkv load_get: req=%s keys=%d bytes=%d ms=%.1f failed=%d",
+                req_id, len(sg_keys), batch_bytes,
+                (time.perf_counter() - load_get_start) * 1000.0,
+                len(failed_block_ids),
+            )
+            if failed_block_ids:
+                self._add_load_error_block_ids(failed_block_ids)
+                logger.warning(
+                    "Failed to get %d dfkv keys from batch "
+                    "(batch_keys=%d, first_failures=%s)",
+                    len(failed_block_ids),
+                    len(sg_keys),
+                    failed_detail[:3],
+                )
+        except Exception as e:
+            self._add_load_error_block_ids(block_id_list_c)
+            self._record_operation(
+                "load_get",
+                load_get_start,
+                len(sg_keys),
+                num_bytes=batch_bytes,
+                status="error",
+                num_failed_keys=len(sg_keys),
+            )
+            logger.warning(
+                "Failed to get dfkv batch %s, error: %s",
+                sg_keys[:3],
+                e,
+            )
+
+        self.set_finished_request(req_id)
+        self.request_queue.task_done()
+
+
+# dfkv: per-key scatter-gather flatten helpers. Mooncake's
+# batch_*_multi_buffers accepted addrs[i]/sizes[i] as a segment list per key;
+# DfkvDeviceClient takes one (ptr, size) per key. For the single-segment
+# (MLA / FlashInfer) path this is a 1:1 passthrough; for the K/V-split layout
+# each segment becomes its own dfkv key ("<key>@seg{n}").
+def _flatten_segments(
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+) -> tuple[list[str], list[int], list[int]]:
+    flat_keys, flat_ptrs, flat_sizes, _ = _flatten_segments_with_owner(
+        keys, addrs, sizes
+    )
+    return flat_keys, flat_ptrs, flat_sizes
+
+
+def _flatten_segments_with_owner(
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+) -> tuple[list[str], list[int], list[int], list[int]]:
+    flat_keys: list[str] = []
+    flat_ptrs: list[int] = []
+    flat_sizes: list[int] = []
+    seg_owner: list[int] = []
+    # dfkv: always suffix "@seg{n}" -- even single-segment keys -- so that the
+    # SAVE, LOAD and LOOKUP paths agree on the on-wire key. The lookup checks
+    # "<key>@seg0" as the block-present proxy (a missing later segment is caught
+    # on load and recomputed; saves are issued as one batch so partials are rare).
+    for key_idx, (key, addr, size) in enumerate(
+        zip(keys, addrs, sizes, strict=True)
+    ):
+        for seg, (a, sz) in enumerate(zip(addr, size, strict=True)):
+            flat_keys.append(f"{key}@seg{seg}")
+            flat_ptrs.append(a)
+            flat_sizes.append(sz)
+            seg_owner.append(key_idx)
+    return flat_keys, flat_ptrs, flat_sizes, seg_owner
+
+
+# dfkv: max payload segments gathered into one scatter-gather key. The HCA
+# max_sge is 30; SGE[0] is the request/value header, leaving 29 for payload.
+SG_MAX_SEGS = 29
+
+
+# dfkv scatter-gather grouping: coalesce each chunk's per-layer segments
+# (addrs[i]/sizes[i]) into "<key>@sg{n}" groups of <= SG_MAX_SEGS segments. Each
+# group is ONE dfkv key carrying all its segments via a single RDMA multi-SGE op
+# (vs _flatten_segments' one key per segment). owner[i] maps each @sg key back to
+# its originating chunk index for per-block load-error attribution.
+def _group_segments_sg(
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+) -> tuple[list[str], list[list[int]], list[list[int]], list[int]]:
+    sg_keys: list[str] = []
+    sg_ptrs: list[list[int]] = []
+    sg_sizes: list[list[int]] = []
+    sg_owner: list[int] = []
+    for key_idx, (key, addr, size) in enumerate(zip(keys, addrs, sizes, strict=True)):
+        grp = 0
+        for off in range(0, len(addr), SG_MAX_SEGS):
+            sg_keys.append(f"{key}@sg{grp}")
+            sg_ptrs.append(list(addr[off:off + SG_MAX_SEGS]))
+            sg_sizes.append(list(size[off:off + SG_MAX_SEGS]))
+            sg_owner.append(key_idx)
+            grp += 1
+    return sg_keys, sg_ptrs, sg_sizes, sg_owner
+
+
+# ============================================================
+# Store Worker
+# ============================================================
+
+
+class DfkvStoreWorker:
+    """Worker-side component for DfkvStoreConnector."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+
+        self.dp_rank = get_dp_engine_index(parallel_config)
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.pp_size = parallel_config.pipeline_parallel_size
+        self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
+
+        self.pcp_size = get_pcp_group().world_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.dcp_size = get_dcp_group().world_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+
+        assert vllm_config.kv_transfer_config is not None
+        self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "load_async", True
+        )
+        self.cache_config = vllm_config.cache_config
+        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        self.num_layers = model_config.get_num_layers(parallel_config)
+
+        self.use_mla = False
+        if (
+            hasattr(model_config, "use_mla")
+            and isinstance(model_config.use_mla, bool)
+            and model_config.use_mla
+        ):
+            self.use_mla = True
+
+        if self.use_mla:
+            self.num_kv_head = 1
+        else:
+            self.num_kv_head = model_config.get_total_num_kv_heads()
+
+        if self.num_kv_head < self.tp_size:
+            self.put_step = self.tp_size // self.num_kv_head
+            self.head_or_tp_rank = self.tp_rank // self.put_step
+        else:
+            self.head_or_tp_rank = self.tp_rank
+            self.put_step = 1
+
+        self.metadata = KeyMetadata(
+            model_name=model_config.model.rstrip("/").split("/")[-1],
+            tp_rank=self.head_or_tp_rank,
+            pcp_rank=self.pcp_rank,
+            dcp_rank=self.dcp_rank,
+            pp_rank=self.pp_rank,
+        )
+
+        # dfkv: replace the MooncakeDistributedStore setup (MooncakeStoreConfig
+        # .load_from_env, rdma_utils RNIC selection, store.setup(), ReplicateConfig,
+        # preferred_segment, enable_offload mode warnings) with the dfkv device
+        # client. dfkv selects its own RNIC via the DFKV_RDMA_DEV env and is
+        # configured entirely through kv_connector_extra_config.
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.client = DfkvDeviceClient(
+            members=extra["members"],
+            model_hash=int(extra.get("model_hash", 0)),
+            lib_path=extra.get("lib"),
+            batch_concurrency=int(extra.get("batch_concurrency", 8)),
+        )
+
+        # dfkv: no disk-offload staging budget (Mooncake owner-DirectIO only).
+
+        # Start lookup server on rank 0 for scheduler-side prefix queries
+        self.lookup_server: LookupKeyServer | None = None
+        if vllm_config.parallel_config.rank == 0:
+            self.lookup_server = LookupKeyServer(self, vllm_config)
+
+        kv_event_config = vllm_config.kv_events_config
+        self.enable_kv_events = False
+        if kv_event_config and kv_event_config.enable_kv_cache_events:
+            self.enable_kv_events = True
+
+        self.kv_send_thread: KVCacheStoreSendingThread | None = None
+        self.kv_recv_thread: KVCacheStoreRecvingThread | None = None
+        self.finished_store_req: set[str] = set()
+        self._kv_connector_stats_lock = threading.Lock()
+        self.kv_connector_stats = DfkvStoreConnectorStats()
+
+        self._kv_cache_config = kv_cache_config
+        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
+        # self.block_size (= scheduler_block_size) so the coordinator's
+        # ``block_size % hash_block_size == 0`` invariant holds.
+        groups = list(kv_cache_config.kv_cache_groups)
+        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
+            g = groups[0]
+            groups = [
+                dataclasses.replace(
+                    g,
+                    kv_cache_spec=dataclasses.replace(
+                        g.kv_cache_spec, block_size=self.block_size
+                    ),
+                )
+            ]
+        self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        use_eagle = bool(
+            spec_cfg.use_eagle()
+            if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
+            else False
+        )
+        self.coord = DfkvStoreCoordinator(
+            self._kv_cache_groups,
+            scheduler_block_size=self.block_size,
+            hash_block_size=self.hash_block_size,
+            use_eagle=use_eagle,
+        )
+        # One ChunkedTokenDatabase per group; addresses populated in
+        # register_kv_caches once the kv-cache layout is known.
+        self.token_dbs: list[ChunkedTokenDatabase] = [
+            ChunkedTokenDatabase(
+                dataclasses.replace(self.metadata, group_id=g_idx),
+                g.kv_cache_spec.block_size,
+                hash_block_size=self.hash_block_size,
+            )
+            for g_idx, g in enumerate(self._kv_cache_groups)
+        ]
+
+    def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
+        """Register a cross-layers KV cache tensor.
+
+        Wraps the unified tensor in a single-entry dict so that the
+        existing stride-based logic in register_kv_caches() produces
+        the correct single-segment result (block_len = page_size * num_layers).
+        """
+        self.register_kv_caches({"__cross_layer__": kv_cache})
+
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+    ) -> None:
+        """Register KV cache tensors and start transfer threads."""
+        if not kv_caches:
+            logger.warning("No KV caches to offload.")
+            return
+
+        # Resolve each entry to a representative tensor for storage
+        # deduplication. For attention layers the value is already a tensor;
+        # for Mamba layers it is a list of tensors that all share the same
+        # underlying raw storage, so we take the first one.
+        def _repr_tensor(v: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+            assert isinstance(v, torch.Tensor | list)
+            return v if isinstance(v, torch.Tensor) else v[0]
+
+        assert self.cache_config.num_gpu_blocks is not None
+        self.num_blocks = self.cache_config.num_gpu_blocks
+
+        # dfkv: map each layer name to its kv_cache_group so that each group's
+        # ChunkedTokenDatabase addresses ONLY its own group's layer segments.
+        # The Mooncake template handed the SAME flat addrs list to every group's
+        # token_db -- correct for single-group models, but for a multi-group
+        # model (DeepSeek-V4 MLA main + lightning-indexer = 2 groups) it makes
+        # group g's block_ids index the OTHER group's layer regions, scattering
+        # the loaded KV into the wrong blocks (load succeeds but is corrupt ->
+        # vLLM resumes over garbage). Partition per group.
+        layer_to_group: dict[str, int] = {}
+        for g_idx, group in enumerate(self._kv_cache_groups):
+            for ln in group.layer_names:
+                layer_to_group[ln] = g_idx
+
+        # dfkv: decouple MR registration (dedup by physical storage) from
+        # per-layer address collection (NEVER dedup). Multiple kv_cache_groups
+        # can ALIAS the same storage -- on DeepSeek-V4-Flash the bs4 partial-
+        # state group (g3) is 168 views of the main-MLA group (g0)'s blocks
+        # (same 8640B/block, off=0, different logical shape). The Mooncake
+        # template deduped by storage in the SAME loop that collected addrs, so
+        # every aliased layer got NO segment -> its group was never offloaded
+        # (observed: segments_per_group=[62,1,0,0,0]). Register each storage
+        # once, but give EVERY layer (aliased or not) its segment in its group.
+        registered_ptrs: set[int] = set()
+        group_addrs: list[list[int]] = [[] for _ in self.token_dbs]
+        group_block_lens: list[list[int]] = [[] for _ in self.token_dbs]
+
+        for layer_name, value in kv_caches.items():
+            cache = _repr_tensor(value)
+            cache_storage = cache.untyped_storage()
+            base_addr = cache_storage.data_ptr()
+            region_len = cache_storage.nbytes()
+
+            # register_memory raises on failure (vs Mooncake's int return), so
+            # a failed GPUDirect MR registration aborts bring-up loudly. Register
+            # each physical storage region ONCE (aliased groups reuse the MR).
+            if base_addr not in registered_ptrs:
+                registered_ptrs.add(base_addr)
+                self.client.register_memory(base_addr, region_len)
+
+            g_idx = layer_to_group[layer_name]
+            # Address THIS layer's blocks from its own tensor data_ptr (== the
+            # storage base when the view offset is 0, which it is on V4-Flash)
+            # and its own per-block byte stride -- independent of any aliasing.
+            layer_addr = cache.data_ptr()
+            # Detect layout via stride: a dim whose byte-stride exceeds
+            # page_size_bytes is an outer segment dim (e.g. the K/V dim of
+            # FlashAttn's (2, num_blocks, ...)). FlashInfer/MLA's blocks-
+            # outermost layout has no such dim and yields a single segment.
+            el = cache.element_size()
+            page_size_bytes = region_len // self.num_blocks
+            outer_dims = [
+                d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
+            ]
+            if not outer_dims:
+                # Blocks-first layout (FlashInfer / MLA): one segment.
+                group_addrs[g_idx].append(layer_addr)
+                group_block_lens[g_idx].append(page_size_bytes)
+            else:
+                # K/V-first layout (FlashAttn / ROCm): split segments.
+                seg_stride = cache.stride(outer_dims[0]) * el
+                for idx in range(cache.shape[outer_dims[0]]):
+                    group_addrs[g_idx].append(layer_addr + idx * seg_stride)
+                    group_block_lens[g_idx].append(seg_stride // self.num_blocks)
+
+        logger.info(
+            "Registered KV caches: num_groups=%d, segments_per_group=%s, num_blocks=%d",
+            len(self.token_dbs),
+            [len(a) for a in group_addrs],
+            self.num_blocks,
+        )
+
+        for g_idx, db in enumerate(self.token_dbs):
+            db.set_kv_caches_base_addr(group_addrs[g_idx])
+            db.set_block_len(group_block_lens[g_idx])
+
+        # Start transfer threads
+        if self.kv_role in ["kv_producer", "kv_both"]:
+            ready_event_sending = threading.Event()
+            self.kv_send_thread = KVCacheStoreSendingThread(
+                self.client,
+                self.coord,
+                self.token_dbs,
+                self.block_size,
+                self.tp_rank,
+                self.put_step,
+                self.kv_role,
+                ready_event_sending,
+                self.enable_kv_events,
+                record_operation=self._record_kv_connector_operation,
+            )
+            self.kv_send_thread.start()
+
+        ready_event_recving = threading.Event()
+        self.kv_recv_thread = KVCacheStoreRecvingThread(
+            self.client,
+            self.coord,
+            self.token_dbs,
+            self.block_size,
+            self.tp_rank,
+            ready_event_recving,
+            record_operation=self._record_kv_connector_operation,
+        )
+        self.kv_recv_thread.start()
+        ready_event_recving.wait()
+
+    def start_load_kv(
+        self,
+        metadata: DfkvStoreConnectorMetadata,
+    ):
+        """No-op: loads are issued in get_finished() for overlap."""
+        pass
+
+    def wait_for_save(
+        self,
+        metadata: DfkvStoreConnectorMetadata,
+    ):
+        """No-op: stores are issued in get_finished() for overlap."""
+        pass
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+        meta: DfkvStoreConnectorMetadata,
+    ) -> tuple[set[str], set[str]]:
+        """Issue all I/O and get completed send/recv request IDs.
+
+        All load and store I/O requests are issued here (after model
+        compute is launched on the compute stream) for better
+        compute-I/O overlap.
+        """
+        # Issue async loads
+        for request in meta.requests:
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+
+            load_spec.token_len = load_spec.kvpool_cached_tokens
+
+            assert self.kv_recv_thread is not None
+            self.kv_recv_thread.add_request(request)
+
+        assert self.load_async, "load_async must be True for better performance."
+        # Issue stores with CUDA event synchronization
+        if self.kv_role in ["kv_producer", "kv_both"]:
+            current_event = None
+            for request in meta.requests:
+                if request.can_save:
+                    current_event = torch.cuda.Event()
+                    current_event.record()
+                    break
+
+            for request in meta.requests:
+                if not request.can_save:
+                    continue
+                request.current_event = current_event
+                assert self.kv_send_thread is not None
+                self.kv_send_thread.add_stored_request(request.req_id)
+                self.kv_send_thread.add_request(request)
+
+        # Check completion of previously queued transfers
+        done_sending = (
+            self._get_and_clear_finished_sending(finished_req_ids, meta)
+            if self.kv_role in ["kv_producer", "kv_both"]
+            else set()
+        )
+
+        done_recving = (
+            self.kv_recv_thread.get_and_clear_finished_requests()
+            if self.load_async and self.kv_recv_thread is not None
+            else set()
+        )
+
+        if done_sending or done_recving:
+            logger.debug(
+                "dfkv get_finished: done_recving=%s done_sending=%s tp=%d",
+                done_recving, done_sending, self.tp_rank,
+            )
+        return done_sending, done_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.kv_recv_thread is None:
+            return set()
+        errs = self.kv_recv_thread.get_and_clear_block_ids_with_load_errors()
+        if errs:
+            logger.warning("dfkv load_errors: %d blocks flagged tp=%d", len(errs), self.tp_rank)
+        return errs
+
+    def _record_kv_connector_operation(
+        self,
+        operation: str,
+        duration_seconds: float,
+        num_keys: int,
+        *,
+        num_bytes: int = 0,
+        status: str = "ok",
+        num_failed_keys: int = 0,
+    ) -> None:
+        with self._kv_connector_stats_lock:
+            self.kv_connector_stats.record_operation(
+                operation=operation,
+                duration_seconds=duration_seconds,
+                num_keys=num_keys,
+                num_bytes=num_bytes,
+                status=status,
+                num_failed_keys=num_failed_keys,
+            )
+
+    def get_kv_connector_stats(self) -> DfkvStoreConnectorStats | None:
+        with self._kv_connector_stats_lock:
+            if self.kv_connector_stats.is_empty():
+                return None
+            kv_connector_stats = self.kv_connector_stats
+            self.kv_connector_stats = DfkvStoreConnectorStats()
+            return kv_connector_stats
+
+    def _get_and_clear_finished_sending(
+        self,
+        finished_req_ids: set[str],
+        meta: DfkvStoreConnectorMetadata,
+    ) -> set[str]:
+        assert self.kv_send_thread is not None
+        finished_sending: set[str] = set()
+
+        for req_id in meta.preempted_req_ids:
+            self.kv_send_thread.delete_finished_stored_request(req_id)
+
+        for req_id in self.kv_send_thread.stored_requests.copy():
+            if (
+                self.kv_send_thread.stored_requests[req_id] == 0
+                and req_id in self.finished_store_req
+            ):
+                self.finished_store_req.remove(req_id)
+                finished_sending.add(req_id)
+                self.kv_send_thread.delete_finished_stored_request(req_id)
+
+        for req_id in finished_req_ids:
+            req_remain_jobs = self.kv_send_thread.stored_requests.get(req_id)
+            if req_remain_jobs == 0:
+                finished_sending.add(req_id)
+                self.kv_send_thread.delete_finished_stored_request(req_id)
+            elif req_remain_jobs is not None:
+                self.finished_store_req.add(req_id)
+
+        return finished_sending
+
+    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+        """Check how many prefix tokens exist in the store.
+
+        Checks across all TP ranks and PP ranks.
+        """
+        if not block_hashes or token_len <= 0:
+            return 0
+
+        # Build per-(group, hash) candidate keys expanded across TP/PP.
+        # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
+        candidate_keys: list[str] = []
+        candidate_meta: list[tuple[int, bytes]] = []
+        tp_count = min(self.tp_size, self.num_kv_head)
+        # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
+        # the SAVE path stores (worker.py save gate) and the LOAD path reads
+        # (load_mask delegates to store_mask). For SlidingWindow groups (V4-Flash
+        # has 4 of them besides the full-MLA group) store_mask keeps only the
+        # in-window tail chunks; without this gate the lookup enumerated every
+        # chunk (4830 vs the 1058 actually stored), so find_longest_cache_hit's
+        # SWA walk demanded never-stored pre-window chunks and collapsed to 0.
+        aligned_token_len = (
+            token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
+        )
+        store_masks = self.coord.store_mask(aligned_token_len)
+        for g_idx, db in enumerate(self.token_dbs):
+            spec_block_size = db.block_size
+            mask = store_masks[g_idx]
+            group_hashes = self.coord.block_hashes_for_spec(
+                block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
+            )
+            for chunk_id, h in enumerate(group_hashes):
+                start_idx = chunk_id * spec_block_size
+                if start_idx >= token_len:
+                    break
+                if chunk_id >= len(mask) or not mask[chunk_id]:
+                    continue
+                for tp in range(tp_count):
+                    for pp in range(self.pp_size):
+                        md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
+                        # dfkv: keys are stored per scatter-gather group
+                        # ("<key>@sg{n}"); probe the first group as the
+                        # block-present proxy so the lookup agrees with the
+                        # SAVE/LOAD on-wire key.
+                        candidate_keys.append(
+                            PoolKey(md, h.hex()).to_string() + "@sg0"
+                        )
+                        candidate_meta.append((g_idx, bytes(h)))
+
+        if not candidate_keys:
+            return 0
+
+        lookup_start = time.perf_counter()
+        try:
+            res = self.client.batch_exist(candidate_keys)
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(candidate_keys),
+            )
+        except Exception as e:
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(candidate_keys),
+                status="error",
+                num_failed_keys=len(candidate_keys),
+            )
+            logger.error("Remote connection failed in lookup: %s", e)
+            return 0
+
+        # A (group, hash) is "present" only when every TP*PP rank has it.
+        expected_per_key = max(1, tp_count * self.pp_size)
+        present_count: dict[tuple[int, bytes], int] = {}
+        for gh, exists in zip(candidate_meta, res, strict=True):
+            if exists == 1:
+                present_count[gh] = present_count.get(gh, 0) + 1
+        exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
+
+        _masks, hit_length = self.coord.find_longest_cache_hit(
+            block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+        )
+        logger.debug(
+            "dfkv lookup: token_len=%d candidates=%d present=%d -> hit_length=%d",
+            token_len, len(candidate_keys), len(exists_set), hit_length,
+        )
+        return hit_length
+
+    def get_kv_events(self) -> list[BlockStored]:
+        if self.enable_kv_events and self.kv_send_thread is not None:
+            return self.kv_send_thread.get_kv_events()
+        return []
+
+
+# ============================================================
+# Lookup Key Server
+# ============================================================
+
+
+class LookupKeyServer:
+    """ZMQ server on worker rank 0 for the LookupKey admin channel.
+
+    Handles two request types, tagged at frame 0:
+    - ``LOOKUP_MSG``: prefix-cache hit query, returns hit count.
+    - ``RESET_MSG``: drains the send thread queue, then attempts a global
+      store wipe. Caller must have paused the scheduler first.
+    """
+
+    def __init__(
+        self,
+        store_worker: DfkvStoreWorker,
+        vllm_config: VllmConfig,
+    ):
+        self.decoder = MsgpackDecoder()
+        self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        self._ipc_path = socket_path.removeprefix("ipc://")
+        if os.path.exists(self._ipc_path):
+            os.unlink(self._ipc_path)
+        self.socket = make_zmq_socket(
+            self.ctx,
+            socket_path,
+            zmq.REP,  # type: ignore[attr-defined]
+            bind=True,
+        )
+
+        self.store_worker = store_worker
+        self.running = True
+
+        def process_request():
+            while self.running:
+                all_frames = self.socket.recv_multipart(copy=False)
+                msg_type = bytes(all_frames[0])
+
+                if msg_type == LOOKUP_MSG:
+                    token_len = int.from_bytes(all_frames[1], byteorder="big")
+                    hash_frames = all_frames[2:]
+                    hashes_str = self.decoder.decode(hash_frames)
+                    block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
+                    result = self.store_worker.lookup(token_len, block_hashes)
+                    self.socket.send(result.to_bytes(4, "big"))
+
+                elif msg_type == RESET_MSG:
+                    # dfkv: DfkvDeviceClient exposes no remove_all / global wipe
+                    # primitive (the dfkv cache is keyed by model_hash + key
+                    # namespace; entries expire by the server's own policy). We
+                    # still drain in-flight puts to honor the ordering contract,
+                    # then NACK so callers know the hard reset was not applied.
+                    try:
+                        if self.store_worker.kv_send_thread is not None:
+                            self.store_worker.kv_send_thread.request_queue.join()
+                    except Exception as e:
+                        logger.error("Dfkv reset drain failed: %s", e)
+                    logger.warning(
+                        "Dfkv store has no remove_all; reset request NACKed "
+                        "(send queue drained)."
+                    )
+                    self.socket.send(RESP_ERR)
+
+                else:
+                    logger.warning(
+                        "LookupKeyServer received unknown msg_type: %r",
+                        msg_type,
+                    )
+                    self.socket.send(RESP_ERR)
+
+        self.thread = threading.Thread(target=process_request, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.socket.close(linger=0)
+        if os.path.exists(self._ipc_path):
+            os.unlink(self._ipc_path)
+
+
+# ============================================================
+# Lookup Key Client
+# ============================================================
+
+
+class LookupKeyClient:
+    """ZMQ client for the LookupKey admin channel.
+
+    Routes both prefix-cache lookups and admin commands (currently:
+    ``reset``) to ``LookupKeyServer`` on worker rank 0. The first frame
+    of every request is a named tag from ``protocol.py``.
+    """
+
+    def __init__(self, vllm_config: VllmConfig):
+        self.encoder = MsgpackEncoder()
+        self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        self.socket = make_zmq_socket(
+            self.ctx,
+            socket_path,
+            zmq.REQ,  # type: ignore[attr-defined]
+            bind=False,
+        )
+
+    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+        hash_strs = [h.hex() for h in block_hashes]
+        hash_frames = self.encoder.encode(hash_strs)
+        token_len_bytes = token_len.to_bytes(4, byteorder="big")
+        all_frames = [LOOKUP_MSG, token_len_bytes] + list(hash_frames)
+        self.socket.send_multipart(all_frames, copy=False)
+        resp = self.socket.recv()
+        result = int.from_bytes(resp, "big")
+        return result
+
+    def reset(self) -> bool:
+        """Trigger a global store wipe on worker rank 0.
+
+        Ordering assumption: caller MUST ensure no in-flight Dfkv
+        lookups or transfers when invoking reset. In RL workflows this
+        holds naturally at the step boundary after weight updates and
+        rollout drain. Returns True on ACK, False on NACK.
+
+        dfkv: dfkv has no remove_all primitive, so the worker drains the
+        send queue and NACKs; this returns False.
+        """
+        self.socket.send(RESET_MSG)
+        resp = self.socket.recv()
+        return bytes(resp) == RESP_OK
+
+    def close(self):
+        self.socket.close(linger=0)
+
+
+def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:
+    """Construct IPC path for ZMQ lookup socket."""
+    assert vllm_config.kv_transfer_config is not None
+    dp_rank = get_dp_engine_index(vllm_config.parallel_config)
+    base_url = envs.VLLM_RPC_BASE_PATH
+    rpc_port = 0
+    hostname = socket.gethostname()
+    extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+    if "lookup_rpc_port" in extra_config:
+        rpc_port = extra_config["lookup_rpc_port"]
+    logger.debug("Base URL: %s, RPC Port: %s", base_url, rpc_port)
+    return (
+        f"ipc://{base_url}/lookup_rpc_port_{rpc_port}_host_{hostname}_dp_rank{dp_rank}"
+    )
