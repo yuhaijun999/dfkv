@@ -45,6 +45,14 @@ vLLM engine process — each DP rank is its own process.
 | `DFKV_RDMA_DEPTH` | `1` | Requests in flight per connection. A latency hider, **not** a throughput knob (GET/PUT are depth-flat — the per-connection serve loop is in-order). Leave at default. |
 | `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
 | `DFKV_LIB` / `DFKV_BUILD` | — | `libdfkv.so` path (overridden by the `lib` extra-config key). |
+| `DFKV_ACCESS_LOG_ENABLED` | `0` | `1` turns on the per-op access log (one line per dfkv client op: `batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/…). Off ⇒ ~100 ns/call no-op; on ⇒ async (background thread), ~µs on the hot path. |
+| `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path; empty ⇒ stderr. |
+| `DFKV_ACCESS_LOG_THRESHOLD_US` | `0` | only log ops slower than this many µs (`0` = log every call). Set e.g. `1000` to surface only ≥1 ms ops. |
+
+The access log shares the same env vars and line format as the dfkv HiCache /
+LMCache connector access logs, so one setting covers every integration. Format:
+`<op>(<args>) : <result> <duration_s>`, e.g.
+`batch_get_auto_sg(20 keys) : hits=20/20, 1310720 bytes <0.007234>`.
 
 ## `kv_connector_extra_config` keys
 

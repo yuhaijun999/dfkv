@@ -97,6 +97,14 @@ vllm serve <model> \
 | `DFKV_RDMA_DEPTH` | `1` | **保持 1** | 每连接在途请求数;延迟隐藏、**非吞吐旋钮**(GET/PUT 都 depth-flat,server 单连接串行) |
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机可设 `1` | 绑 buffer/线程到轨的 NUMA 节点 + 选 NUMA-local 轨 |
 | `DFKV_LIB` / `DFKV_BUILD` | — | `libdfkv.so` 路径 | 被 extra_config.lib 覆盖 |
+| `DFKV_ACCESS_LOG_ENABLED` | `0` | 排查时设 `1` | 逐 op 访问日志(`batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/`register_memory`);关=约 100ns 空操作,开=异步落盘、热路径约 µs |
+| `DFKV_ACCESS_LOG_PATH` | stderr | `/var/log/dfkv/vllm-access.log` | 日志路径;空=写 stderr |
+| `DFKV_ACCESS_LOG_THRESHOLD_US` | `0` | 查长尾设 `1000` | 仅记耗时 ≥ 该 µs 的 op,`0`=全记 |
+
+> 访问日志与 dfkv HiCache / LMCache 连接器**同一套环境变量、同一行格式**:
+> `<op>(<args>) : <result> <秒>`,如
+> `batch_get_auto_sg(20 keys) : hits=20/20, 1310720 bytes <0.007234>`。
+> 每个 vLLM 引擎进程各写各的,多 DP rank 建议用 `DFKV_ACCESS_LOG_PATH` 区分(如带 rank 后缀)或留 stderr 随引擎日志走。
 
 ### B. `kv_connector_extra_config`
 

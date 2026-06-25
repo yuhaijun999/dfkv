@@ -18,6 +18,7 @@ import ctypes
 from typing import Optional, Sequence
 
 from ._cabi import load_lib
+from .access_log import access_log
 
 c_void_p = ctypes.c_void_p
 c_char_p = ctypes.c_char_p
@@ -82,11 +83,12 @@ class DfkvDeviceClient:
     def register_memory(self, base: int, size: int) -> None:
         """Register a (host or GPU device) region as an RDMA MR. One call per
         contiguous KV-cache storage region; later put/get reference offsets."""
-        rc = self._lib.dfkv_register_memory(self._h, c_void_p(base), c_uint64(size))
-        if rc != 0:
-            raise RuntimeError(
-                f"dfkv_register_memory(base={base:#x}, size={size}) rc={rc}"
-            )
+        with access_log("register_memory", lambda: f"base={base:#x}, {size} bytes"):
+            rc = self._lib.dfkv_register_memory(self._h, c_void_p(base), c_uint64(size))
+            if rc != 0:
+                raise RuntimeError(
+                    f"dfkv_register_memory(base={base:#x}, size={size}) rc={rc}"
+                )
 
     def batch_put(
         self, keys: Sequence[str], ptrs: Sequence[int], sizes: Sequence[int]
@@ -99,14 +101,17 @@ class DfkvDeviceClient:
         of the single ``dfkv_put`` which returns 0=ok). We normalize here to the
         connector's "0 = ok" convention so callers don't have to know this."""
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
-        parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
-        sarr = (c_uint64 * n)(*sizes)
-        out = (c_int * n)()
-        rc = self._lib.dfkv_batch_put(self._h, karr, parr, sarr, n, out)
-        if rc != 0:
-            raise RuntimeError(f"dfkv_batch_put rc={rc}")
-        return [0 if ok == 1 else 1 for ok in out]
+        with access_log("batch_put", lambda: f"{n} keys, {sum(sizes)} bytes") as r:
+            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
+            sarr = (c_uint64 * n)(*sizes)
+            out = (c_int * n)()
+            rc = self._lib.dfkv_batch_put(self._h, karr, parr, sarr, n, out)
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_put rc={rc}")
+            res = [0 if ok == 1 else 1 for ok in out]
+            r.result = f"ok={res.count(0)}/{n}"
+            return res
 
     def batch_get(
         self, keys: Sequence[str], ptrs: Sequence[int], caps: Sequence[int]
@@ -115,17 +120,20 @@ class DfkvDeviceClient:
         ``caps[i]``). Returns ``(hits, lengths)``: ``hits[i]`` is 1 on hit, 0 on
         miss; ``lengths[i]`` is the true stored byte length on hit."""
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
-        parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
-        carr = (c_uint64 * n)(*caps)
-        out_hit = (c_int * n)()
-        out_len = (c_uint64 * n)()
-        rc = self._lib.dfkv_batch_get_auto(
-            self._h, karr, parr, carr, n, out_hit, out_len
-        )
-        if rc != 0:
-            raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
-        return list(out_hit), list(out_len)
+        with access_log("batch_get_auto", lambda: f"{n} keys") as r:
+            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
+            carr = (c_uint64 * n)(*caps)
+            out_hit = (c_int * n)()
+            out_len = (c_uint64 * n)()
+            rc = self._lib.dfkv_batch_get_auto(
+                self._h, karr, parr, carr, n, out_hit, out_len
+            )
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
+            hits, lens = list(out_hit), list(out_len)
+            r.result = f"hits={sum(hits)}/{n}, {sum(lens)} bytes"
+            return hits, lens
 
     def batch_put_sg(
         self,
@@ -139,22 +147,28 @@ class DfkvDeviceClient:
         (max_sge-1); the C ABI reports a >29 key failed. Returns per-key status
         (``0`` = ok, ``1`` = failed), same "0=ok" normalization as ``batch_put``."""
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
-        # Keep the per-key inner arrays alive for the duration of the call.
-        inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
-        inner_s = [(c_uint64 * len(s))(*s) for s in seg_sizes]
-        parr = (ctypes.POINTER(c_void_p) * n)(
-            *[ctypes.cast(a, ctypes.POINTER(c_void_p)) for a in inner_p]
-        )
-        sarr = (ctypes.POINTER(c_uint64) * n)(
-            *[ctypes.cast(a, ctypes.POINTER(c_uint64)) for a in inner_s]
-        )
-        narr = (c_int * n)(*[len(p) for p in seg_ptrs])
-        out = (c_int * n)()
-        rc = self._lib.dfkv_batch_put_sg(self._h, karr, parr, sarr, narr, n, out)
-        if rc != 0:
-            raise RuntimeError(f"dfkv_batch_put_sg rc={rc}")
-        return [0 if ok == 1 else 1 for ok in out]
+        with access_log(
+            "batch_put_sg",
+            lambda: f"{n} keys, {sum(sum(s) for s in seg_sizes)} bytes",
+        ) as r:
+            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            # Keep the per-key inner arrays alive for the duration of the call.
+            inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
+            inner_s = [(c_uint64 * len(s))(*s) for s in seg_sizes]
+            parr = (ctypes.POINTER(c_void_p) * n)(
+                *[ctypes.cast(a, ctypes.POINTER(c_void_p)) for a in inner_p]
+            )
+            sarr = (ctypes.POINTER(c_uint64) * n)(
+                *[ctypes.cast(a, ctypes.POINTER(c_uint64)) for a in inner_s]
+            )
+            narr = (c_int * n)(*[len(p) for p in seg_ptrs])
+            out = (c_int * n)()
+            rc = self._lib.dfkv_batch_put_sg(self._h, karr, parr, sarr, narr, n, out)
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_put_sg rc={rc}")
+            res = [0 if ok == 1 else 1 for ok in out]
+            r.result = f"ok={res.count(0)}/{n}"
+            return res
 
     def batch_get_auto_sg(
         self,
@@ -167,39 +181,46 @@ class DfkvDeviceClient:
         ``seg_caps[i][..]`` (the segment sizes define the split). Returns
         ``(hits, lengths)`` where ``lengths[i]`` is the total stored bytes."""
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
-        inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
-        inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
-        parr = (ctypes.POINTER(c_void_p) * n)(
-            *[ctypes.cast(a, ctypes.POINTER(c_void_p)) for a in inner_p]
-        )
-        carr = (ctypes.POINTER(c_uint64) * n)(
-            *[ctypes.cast(a, ctypes.POINTER(c_uint64)) for a in inner_c]
-        )
-        narr = (c_int * n)(*[len(p) for p in seg_ptrs])
-        out_hit = (c_int * n)()
-        out_len = (c_uint64 * n)()
-        rc = self._lib.dfkv_batch_get_auto_sg(
-            self._h, karr, parr, carr, narr, n, out_hit, out_len
-        )
-        if rc != 0:
-            raise RuntimeError(f"dfkv_batch_get_auto_sg rc={rc}")
-        return list(out_hit), list(out_len)
+        with access_log("batch_get_auto_sg", lambda: f"{n} keys") as r:
+            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
+            inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
+            parr = (ctypes.POINTER(c_void_p) * n)(
+                *[ctypes.cast(a, ctypes.POINTER(c_void_p)) for a in inner_p]
+            )
+            carr = (ctypes.POINTER(c_uint64) * n)(
+                *[ctypes.cast(a, ctypes.POINTER(c_uint64)) for a in inner_c]
+            )
+            narr = (c_int * n)(*[len(p) for p in seg_ptrs])
+            out_hit = (c_int * n)()
+            out_len = (c_uint64 * n)()
+            rc = self._lib.dfkv_batch_get_auto_sg(
+                self._h, karr, parr, carr, narr, n, out_hit, out_len
+            )
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_get_auto_sg rc={rc}")
+            hits, lens = list(out_hit), list(out_len)
+            r.result = f"hits={sum(hits)}/{n}, {sum(lens)} bytes"
+            return hits, lens
 
     def batch_exist(self, keys: Sequence[str]) -> list:
         """Return ``[1|0]`` per key (1 = present in the cache)."""
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
-        out = (c_int * n)()
-        rc = self._lib.dfkv_batch_exist(self._h, karr, n, out)
-        if rc != 0:
-            raise RuntimeError(f"dfkv_batch_exist rc={rc}")
-        return list(out)
+        with access_log("batch_exist", lambda: f"{n} keys") as r:
+            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            out = (c_int * n)()
+            rc = self._lib.dfkv_batch_exist(self._h, karr, n, out)
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_exist rc={rc}")
+            res = list(out)
+            r.result = f"present={res.count(1)}/{n}"
+            return res
 
     def close(self) -> None:
         if getattr(self, "_h", None):
-            self._lib.dfkv_close(self._h)
-            self._h = None
+            with access_log("close", lambda: ""):
+                self._lib.dfkv_close(self._h)
+                self._h = None
 
     def __del__(self):
         try:
