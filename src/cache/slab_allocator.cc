@@ -143,6 +143,9 @@ bool SlabAllocator::BindFreeExtent(size_t cls) {
     extents_[e].free_slots = total;
     extents_[e].pinned = 0;
     --unbound_;
+    // Wipe-before-use: stale persisted records from a previous binding must be
+    // gone before any slot of this extent can be handed out (same lock hold).
+    if (opt_.on_extent_bind) opt_.on_extent_bind(e);
     for (uint32_t s = 0; s < total; ++s) PushFreeLocked(C, e, s);
     return true;
   }

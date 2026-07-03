@@ -71,6 +71,22 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   ao.num_extents = num_extents_;
   ao.align = static_cast<uint32_t>(opt_.slot_granularity);  // slot_size is a granularity multiple
   ao.max_waste = 0.25;
+  // Runtime (re)bind of an extent -- initial, steal, or pool re-bind -- must
+  // physically destroy the previous binding's records BEFORE any new-slot use:
+  // a stale-but-CRC-valid record at a slot-grid position the new class never
+  // writes would otherwise survive to the next rebuild and resurrect its old
+  // key over the new occupant's bytes (cross-class poisoning). Durable (an
+  // inline fdatasync) so a crash right after the rebind can't see old records;
+  // rebinds are rare (workload-mix shifts), so the ms-scale sync under the
+  // allocator lock is acceptable.
+  ao.on_extent_bind = [this](uint32_t e) {
+    const std::vector<char> zeros(
+        static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
+    if (PwriteAll(table_fd_, zeros.data(), zeros.size(), TableOffset(e, 0))) {
+      ::fdatasync(table_fd_);
+      bind_wipes_.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
   alloc_ = std::make_unique<SlabAllocator>(ao);
 
   ok_ = OpenOrInit();
@@ -218,6 +234,13 @@ void DiskSlabStore::Rebuild() {
       if (alloc_->Restore(fn, slot_size, e, s)) {
         payload_len_[fn] = payload_len;
         ++table_rebuilt_;
+      } else {
+        // Rejected record (duplicate slot, class mismatch on the extent, out of
+        // range): physically clear it so pre-fix mixed-class leftovers can't
+        // win the first-record race on a LATER rebuild and resurrect an old key
+        // over another class's bytes.
+        uint8_t zero[kRecBytes] = {0};
+        PwriteAll(table_fd_, zero, kRecBytes, TableOffset(e, s));
       }
     }
   }
@@ -558,6 +581,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.dio_write_fallbacks = dio_write_fallbacks_.load(std::memory_order_relaxed);
   st.dio_read_fallbacks = dio_read_fallbacks_.load(std::memory_order_relaxed);
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
+  st.bind_wipes = bind_wipes_.load(std::memory_order_relaxed);
   st.steals = alloc_->Steals();
   st.extent_returns = alloc_->ExtentReturns();
   std::lock_guard<std::mutex> lk(mu_);

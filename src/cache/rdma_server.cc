@@ -186,6 +186,8 @@ size_t UringDepth(size_t k) {
 
 }  // namespace
 
+size_t RdmaServer::PipelineDepth() const { return ServerDepth(); }
+
 bool RdmaServer::UseUringPath() const {
 #ifdef DFKV_WITH_URING
   if (!range_prep_handler_ || !range_complete_handler_) return false;

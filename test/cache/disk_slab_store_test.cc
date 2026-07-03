@@ -386,3 +386,40 @@ TEST_F(DiskSlabTest, DioFallbackIsCounted) {
   ASSERT_EQ(s.CacheDirect(K(1), &v[0], v.size(), v.size()), Status::kOk);
   EXPECT_EQ(s.GetStats().dio_write_fallbacks, 1u);
 }
+
+// An extent STOLEN to a new class must not let the old class's stale records
+// (eviction leaves them CRC-valid by design) survive to the next rebuild --
+// pre-fix they could win the first-record scan and resurrect an old key
+// pointing at the NEW class's bytes (cross-class poisoning).
+TEST_F(DiskSlabTest, RebindWipesStaleRecordsNoResurrectionAcrossRestart) {
+  std::vector<int> absent_after_steal;
+  std::string bval(8000, 'B');
+  {
+    bool ok = false;
+    // 2 extents x 4 slots(4096): 8 class-A keys fill both extents.
+    DiskSlabStore s(Opts(2 * 4 * 4096, 4 * 4096, 4096), &ok);
+    ASSERT_TRUE(ok);
+    std::string a(4000, 'A');
+    for (int i = 0; i < 8; ++i)
+      ASSERT_EQ(s.Cache(K(100 + i), a.data(), a.size()), Status::kOk);
+    ASSERT_EQ(s.Count(), 8u);
+    // Class B (8192): pool empty -> STEAL an A extent (evicts its 4 residents,
+    // records left stale) -> with the fix, the rebind wipes that table region.
+    ASSERT_EQ(s.Cache(K(500), bval.data(), bval.size()), Status::kOk);
+    EXPECT_GE(s.GetStats().bind_wipes, 1u) << "steal rebind must wipe the region";
+    for (int i = 0; i < 8; ++i)
+      if (!s.IsCached(K(100 + i))) absent_after_steal.push_back(100 + i);
+    ASSERT_EQ(absent_after_steal.size(), 4u) << "steal evicts one extent's residents";
+  }
+  // Restart: the stolen extent's old keys must STAY dead; B and the surviving
+  // extent's keys must read back intact.
+  bool ok = false;
+  DiskSlabStore s2(Opts(2 * 4 * 4096, 4 * 4096, 4096), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(s2.Count(), 5u) << "4 surviving A keys + B; no resurrection";
+  for (int id : absent_after_steal)
+    EXPECT_FALSE(s2.IsCached(K(id))) << "stale key " << id << " resurrected!";
+  std::string out;
+  ASSERT_EQ(s2.Range(K(500), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, bval);
+}

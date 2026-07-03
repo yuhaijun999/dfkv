@@ -54,6 +54,41 @@ inline void BindMemory(void* addr, size_t len, int node) {
   ::syscall(SYS_mbind, addr, len, 2 /*MPOL_BIND*/, mask, 1024UL, 0u);
 }
 
+// Number of online NUMA nodes (sysfs "online" list like "0-1"), or 1 on any
+// parse failure. Ungated: callers decide their own policy.
+inline int OnlineNodeCount() {
+  FILE* f = std::fopen("/sys/devices/system/node/online", "r");
+  if (!f) return 1;
+  char buf[256] = {0};
+  size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+  std::fclose(f);
+  if (n == 0) return 1;
+  int count = 0;
+  const char* p = buf;
+  while (*p) {
+    int lo = -1, hi = -1, consumed = 0;
+    if (std::sscanf(p, "%d-%d%n", &lo, &hi, &consumed) >= 2) count += hi - lo + 1;
+    else if (std::sscanf(p, "%d%n", &lo, &consumed) >= 1) count += 1;
+    else break;
+    p += consumed;
+    while (*p == ',' || *p == ' ' || *p == '\n') ++p;
+  }
+  return count > 0 ? count : 1;
+}
+
+// Spread [addr, len) pages round-robin across nodes [0, nodes) so a large
+// shared arena doesn't land entirely on the pre-faulting thread's socket
+// (worst case: every remote-socket consumer pays the interconnect on every
+// access). MPOL_INTERLEAVE = 3. Ungated + best-effort; call BEFORE the pages
+// are first touched (policy only affects new allocations).
+inline void InterleaveMemory(void* addr, size_t len, int nodes) {
+  if (nodes <= 1 || nodes >= 1024) return;
+  unsigned long mask[1024 / (8 * sizeof(unsigned long))] = {0};
+  for (int n = 0; n < nodes; ++n)
+    mask[n / (8 * sizeof(unsigned long))] |= 1UL << (n % (8 * sizeof(unsigned long)));
+  ::syscall(SYS_mbind, addr, len, 3 /*MPOL_INTERLEAVE*/, mask, 1024UL, 0u);
+}
+
 // Pin the calling thread to the CPUs of `node` (sysfs cpulist). Best-effort.
 inline void PinThreadToNode(int node) {
   if (!Enabled() || node < 0) return;

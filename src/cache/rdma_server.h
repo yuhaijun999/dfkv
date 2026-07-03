@@ -139,6 +139,11 @@ class RdmaServer {
   // otherwise silent by design, correctness-first).
   uint64_t UringReads() const { return uring_reads_.load(std::memory_order_relaxed); }
   uint64_t UringInitFallbacks() const { return uring_init_fallbacks_.load(std::memory_order_relaxed); }
+  // The server-side pipeline depth (env DFKV_RDMA_DEPTH, default 1) -- surfaced
+  // in ring INFO because the CLIENT's depth must not exceed it: excess in-flight
+  // requests hit receiver-not-ready retries and degrade SILENTLY (measured 3-4x
+  // on pipelined GETs), they don't fail.
+  size_t PipelineDepth() const;
   std::string MetricsText() const;  // Prometheus text (dfkv_rdma_*)
 
  private:

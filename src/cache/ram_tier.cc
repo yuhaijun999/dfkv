@@ -1,8 +1,12 @@
 #include "cache/ram_tier.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+
+#include "utils/log.h"
+#include "utils/numa_util.h"
 
 namespace dfkv {
 
@@ -15,10 +19,42 @@ RamTier::RamTier(Options opt, FlushFn flush)
   // a granularity multiple) are O_DIRECT-aligned for the flusher (gap 10.4).
   if (posix_memalign(&p, 4096, opt_.bytes) != 0 || p == nullptr) return;
   arena_ = static_cast<char*>(p);
-  // Pre-fault the arena now (one bounded cost at startup) instead of paying
-  // first-touch page faults on the PUT hot path. With RDMA the MR registration
-  // pins pages anyway; this covers TCP-only runs and makes startup cost explicit.
-  std::memset(arena_, 0, opt_.bytes);
+  // NUMA: interleave the arena across sockets BEFORE first touch. A single
+  // pre-faulting thread would otherwise land every page on its own node, and
+  // all remote-socket consumers (serve threads, NIC DMA on the far rail) pay
+  // the interconnect on every access. Interleave is the balanced default for a
+  // shared arena; DFKV_RAM_TIER_NUMA=off opts out (e.g. to combine with
+  // DFKV_RDMA_NUMA-pinned single-rail setups).
+  const char* nm = std::getenv("DFKV_RAM_TIER_NUMA");
+  const bool interleave = !(nm && std::strcmp(nm, "off") == 0);
+  const int nodes = numa::OnlineNodeCount();
+  if (interleave) numa::InterleaveMemory(arena_, opt_.bytes, nodes);
+  // Pre-fault the arena now (one bounded, REPORTED cost at startup) instead of
+  // paying first-touch page faults on the PUT hot path; parallel workers keep
+  // large arenas to seconds. With RDMA the MR registration pins pages anyway;
+  // this covers TCP-only runs and makes the cost explicit either way.
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    const unsigned hw = std::thread::hardware_concurrency();
+    const size_t nt = std::max(1u, std::min(hw ? hw / 4 : 4u, 16u));
+    const size_t chunk = (opt_.bytes + nt - 1) / nt;
+    std::vector<std::thread> ws;
+    for (size_t i = 0; i < nt; ++i) {
+      const size_t off = i * chunk;
+      if (off >= opt_.bytes) break;
+      const size_t n = std::min(chunk, opt_.bytes - off);
+      ws.emplace_back([this, off, n] { std::memset(arena_ + off, 0, n); });
+    }
+    for (auto& w : ws) w.join();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    DFKV_LOG_INFO("ram tier arena pre-faulted: " +
+                  std::to_string(opt_.bytes >> 20) + " MiB in " +
+                  std::to_string(ms) + " ms (threads=" + std::to_string(ws.size()) +
+                  ", numa=" + (interleave && nodes > 1
+                                   ? "interleave/" + std::to_string(nodes) + "nodes"
+                                   : "default") + ")");
+  }
 
   SlabAllocator::Options ao;
   ao.extent_bytes = opt_.bytes;   // the whole arena is one extent

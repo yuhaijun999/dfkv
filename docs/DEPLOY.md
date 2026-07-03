@@ -128,7 +128,8 @@ WantedBy=multi-user.target
 > - `--ram-tier on`（默认关）：写直通 RAM 热层 + RDMA arena 零拷贝 GET；`--ram-tier-bytes <bytes>` 定 arena 大小（预注册即 pin 内存，须核 `MemoryMax` 有余量）。开后观测 `dfkv_ram_hit_total` / `dfkv_ram_put_bypass_total`（见 METRICS.md §3.1）。**direct 模式下 flusher 经 CacheDirect DIO 落盘，RAM 池写入量不过 page cache。**
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS`（slots.tbl fdatasync 节奏，默认 100，0=关；限定崩溃复活窗口）、`DFKV_RAM_FLUSH_THREADS`（RAM 落盘 worker 数，默认=盘数）。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：slot 量子，小值负载调小（64KB 值在 1MiB 粒度下浪费 94%）。**改动 = 布局变化 = 该店清空冷启**，按迁移动作对待。
-> - `--put-inflight-limit <n>`（默认 0=关）：并发盘写超过 n 的 PUT 以 kCacheFull 快速拒绝（客户端视为普通 put 失败、不进 cooldown）= 用受控 miss 换掉过载排队尾延迟。
+> - `--put-inflight-limit <n>`（默认 0=关）：并发盘写超过 n 的 PUT 以 kCacheFull 快速拒绝（客户端视为普通 put 失败、不进 cooldown）= 用受控 miss 换掉过载排队尾延迟。RDMA 与 TCP 两条数据路径同受此门约束；RAM 热层的异步 flusher 落盘**不受**此门限制（否则背压会放大为 flush 丢弃）。
+> - RAM 热层 arena 预触 + RDMA MR 注册都在启动期走页：**arena 每 16 GiB 约 +5-10s 启动时间**，配大 arena（≥64 GiB）时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
 > GPU 节点推荐组合：`--store-engine slab`（direct 已默认）+ `--ram-tier on` + 按节点突发画像定 `--ram-tier-bytes`。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv

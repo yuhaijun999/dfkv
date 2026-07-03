@@ -67,6 +67,7 @@ class DiskSlabStore : public StoreEngine {
     uint64_t dio_write_fallbacks = 0;  // direct mode: writes that fell back buffered
     uint64_t dio_read_fallbacks = 0;   // direct mode: aligned reads that fell back
     uint64_t table_syncs = 0;          // fdatasync cycles actually performed
+    uint64_t bind_wipes = 0;           // extent table regions wiped on (re)bind
     uint64_t steals = 0;               // allocator cross-class extent steals
     uint64_t extent_returns = 0;       // fully-free extents returned to the pool
     uint64_t deferred_removes = 0;     // Removes deferred behind in-flight I/O
@@ -178,6 +179,7 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> dio_write_fallbacks_{0};
   std::atomic<uint64_t> dio_read_fallbacks_{0};
   std::atomic<uint64_t> table_syncs_{0};
+  std::atomic<uint64_t> bind_wipes_{0};
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
   // records were written since the last cycle.
   std::atomic<uint64_t> record_writes_{0};

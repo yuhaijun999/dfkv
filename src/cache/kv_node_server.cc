@@ -322,8 +322,18 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
         st = Status::kOk;
         cache_put_.fetch_add(1, std::memory_order_relaxed);
         bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
+      } else if (put_busy_limit_ > 0 &&
+                 disk_put_inflight_.load(std::memory_order_relaxed) >=
+                     put_busy_limit_) {
+        // Same admission gate as the RDMA CacheDirect path (see there): the TCP
+        // data path is non-production but must not become an ungated side door
+        // around the disk-write cap.
+        st = Status::kCacheFull;
+        put_busy_.fetch_add(1, std::memory_order_relaxed);
       } else {
+        disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
         st = group_.Cache(key, payload, payload_len);
+        disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
         if (st == Status::kOk) {
           cache_put_.fetch_add(1, std::memory_order_relaxed);
           bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);

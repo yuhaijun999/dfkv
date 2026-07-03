@@ -275,6 +275,9 @@ int main(int argc, char** argv) {
                              ? std::to_string(srv.ram_arena_bytes()) : std::string("0"));
 #ifdef DFKV_WITH_RDMA
       info += ",rdma=" + std::string(rsrv ? (rdma_dev.empty() ? "on" : rdma_dev.c_str()) : "off");
+      // Server pipeline depth: clients pipelining deeper than this hit RNR-retry
+      // degradation, so the fleet audit must show it next to the transport.
+      if (rsrv) info += ",qd=" + std::to_string(rsrv->PipelineDepth());
 #else
       info += ",rdma=nobuild";
 #endif

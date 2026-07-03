@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,15 @@ class SlabAllocator {
     // Reuse an existing (larger) class instead of creating a new one when the
     // internal waste (slot_size - aligned_len) stays under this fraction.
     double max_waste = 0.25;
+    // Fired (under the allocator lock) whenever a RUNTIME bind hands extent E to
+    // a class -- initial bind, steal, or pool re-bind. A persistent caller MUST
+    // wipe E's stale metadata here: records left by a PREVIOUS class survive a
+    // rebind (they sit at slot-grid positions the new class never overwrites),
+    // and a later rebuild can resurrect an old key pointing at the new
+    // occupant's bytes. NOT fired on Restore's rebuild-time binds (those records
+    // are the source of truth being read). Optional; RamTier (no persistence)
+    // leaves it empty.
+    std::function<void(uint32_t extent)> on_extent_bind;
   };
 
   explicit SlabAllocator(Options opt);
