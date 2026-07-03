@@ -165,3 +165,75 @@ TEST(MembersEpoch, InfoIsExcludedFromEpochAndEquality) {
   EXPECT_EQ(MembersEpoch(a), MembersEpoch(b));
   EXPECT_EQ(a[0], b[0]);
 }
+
+// STA1 dynamic-stats extension: round-trip, per-member presence, legacy
+// absence, forward-skip of unknown appended fields, and the epoch/equality
+// exclusion that keeps heartbeat churn from rebuilding client rings.
+TEST(Membership, StatsRoundTripWithMixedPresence) {
+  MemberInfo a{"n1", "10.0.0.1", 28001, 1, 28100, "ver=1.10.0"};
+  a.stats.capacity_bytes = 5ull << 40;
+  a.stats.used_bytes = 123456789;
+  a.stats.objects = 42;
+  a.stats.hits_total = 1000;
+  a.stats.misses_total = 50;
+  a.stats.evictions_total = 7;
+  a.stats.puts_total = 1100;
+  a.stats.uptime_seconds = 3600;
+  a.stats.put_busy_total = 3;
+  a.stats.dio_write_fallbacks = 1;
+  a.stats.ram_used_bytes = 1 << 30;
+  a.stats.ram_hits_total = 900;
+  a.has_stats = true;
+  MemberInfo b{"n2", "10.0.0.2", 28001, 3, 28100, ""};  // no stats (pre-upgrade)
+  std::string enc = EncodeMembers({a, b}, 5);
+  std::vector<MemberInfo> out;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(enc.data(), enc.size(), &out, &epoch));
+  ASSERT_EQ(out.size(), 2u);
+  ASSERT_TRUE(out[0].has_stats);
+  EXPECT_EQ(out[0].stats.capacity_bytes, 5ull << 40);
+  EXPECT_EQ(out[0].stats.used_bytes, 123456789u);
+  EXPECT_EQ(out[0].stats.objects, 42u);
+  EXPECT_EQ(out[0].stats.hits_total, 1000u);
+  EXPECT_EQ(out[0].stats.ram_hits_total, 900u);
+  EXPECT_EQ(out[0].stats.uptime_seconds, 3600u);
+  EXPECT_FALSE(out[1].has_stats);
+}
+
+TEST(Membership, StatsForwardSkipUnknownAppendedFields) {
+  // A FUTURE encoder appends fields: emulate by patching nfields up and
+  // appending extra u64s per present member. Today's decoder must read its
+  // known fields and skip the tail cleanly.
+  MemberInfo a{"n1", "10.0.0.1", 28001, 1, 28100, ""};
+  a.stats.capacity_bytes = 77;
+  a.has_stats = true;
+  std::string enc = EncodeMembers({a}, 1);
+  // Locate STA1: it is the LAST extension; nfields byte follows the tag.
+  const uint32_t tag = 0x31415453u;
+  size_t pos = std::string::npos;
+  for (size_t i = 0; i + 4 <= enc.size(); ++i) {
+    uint32_t v;
+    std::memcpy(&v, enc.data() + i, 4);
+    if (v == tag) pos = i;
+  }
+  ASSERT_NE(pos, std::string::npos);
+  enc[pos + 4] = static_cast<char>(kMemberStatsFields + 2);  // future: 2 extra fields
+  char extra[16] = {0};
+  enc.append(extra, 16);  // the 2 extra u64s for the one present member
+  std::vector<MemberInfo> out;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(enc.data(), enc.size(), &out, &epoch));
+  ASSERT_EQ(out.size(), 1u);
+  ASSERT_TRUE(out[0].has_stats);
+  EXPECT_EQ(out[0].stats.capacity_bytes, 77u);
+}
+
+TEST(Membership, StatsExcludedFromEpochAndEquality) {
+  MemberInfo a{"n1", "10.0.0.1", 28001, 1, 28100, "ver=x"};
+  MemberInfo b = a;
+  b.stats.used_bytes = 999;  // heartbeat churn
+  b.has_stats = true;
+  EXPECT_TRUE(a == b) << "stats must not affect member equality";
+  EXPECT_EQ(MembersEpoch({a}), MembersEpoch({b}))
+      << "stats churn must never rebuild client rings";
+}

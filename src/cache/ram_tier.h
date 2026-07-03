@@ -115,6 +115,7 @@ class RamTier {
   uint64_t Flushed() const { return flushed_.load(std::memory_order_relaxed); }
   uint64_t FlushDropped() const { return flush_dropped_.load(std::memory_order_relaxed); }
   uint64_t Evictions() const { return alloc_->Evictions(); }
+  uint64_t UsedBytes() const { return alloc_->UsedBytes(); }  // resident slot bytes
   size_t Count() const;
   size_t FlushBacklog() const;  // queued, not-yet-durable items
 

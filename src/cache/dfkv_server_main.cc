@@ -284,6 +284,25 @@ int main(int argc, char** argv) {
       self.info = std::move(info);
     }
     registrar = std::make_unique<dfkv::MdsRegistrar>(std::move(eps), group, self);
+    // Dynamic stats ride every heartbeat (STA1): ring-level capacity/health
+    // becomes answerable from the MDS alone (dfkvctl stats / dfkv_mds_group_*),
+    // no per-node scrape. All reads are relaxed atomics -- negligible cost.
+    registrar->set_stats_provider([&srv, cap]() {
+      dfkv::MemberStats st;
+      st.capacity_bytes = cap;
+      st.used_bytes = srv.UsedBytes();
+      st.objects = srv.Count();
+      st.hits_total = srv.m_cache_hit();
+      st.misses_total = srv.m_cache_miss();
+      st.evictions_total = srv.Evictions();
+      st.puts_total = srv.m_cache_put();
+      st.uptime_seconds = srv.UptimeSeconds();
+      st.put_busy_total = srv.PutBusyTotal();
+      st.dio_write_fallbacks = srv.DioWriteFallbacks();
+      st.ram_used_bytes = srv.RamUsedBytes();
+      st.ram_hits_total = srv.RamHits();
+      return st;
+    });
     registrar->Start();
     DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group + " id=" + node_id +
                   " advertise=" + advertise);

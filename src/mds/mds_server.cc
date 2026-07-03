@@ -1,5 +1,7 @@
 #include "mds/mds_server.h"
 
+#include <map>
+
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -171,6 +173,111 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out) {
   return Status::kOk;
 }
 
+Status MdsServer::ListGroups(std::string* out) {
+  auto r = etcd_.RangePrefix("/dfkv/v1/groups/");
+  if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
+  // Key shape: /dfkv/v1/groups/<group>/members/<id> -- collect distinct <group>.
+  std::string prev;
+  std::string joined;
+  for (const auto& kv : r->kvs) {
+    const std::string& k = kv.first;
+    const size_t base = sizeof("/dfkv/v1/groups/") - 1;
+    if (k.size() <= base) continue;
+    const size_t slash = k.find('/', base);
+    if (slash == std::string::npos) continue;
+    std::string g = k.substr(base, slash - base);
+    if (g == prev) continue;  // keys arrive sorted: dedup against the previous
+    prev = g;
+    if (!joined.empty()) joined += '\n';
+    joined += g;
+  }
+  *out = std::move(joined);
+  return Status::kOk;
+}
+
+std::string MdsServer::GroupMetricsText() {
+  auto r = etcd_.RangePrefix("/dfkv/v1/groups/");
+  if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return ""; }
+  struct Agg {
+    uint64_t nodes = 0, missing = 0;
+    MemberStats sum;
+    std::map<std::string, int> vers;  // version skew, from info "ver="
+  };
+  std::map<std::string, Agg> groups;
+  const size_t base = sizeof("/dfkv/v1/groups/") - 1;
+  for (const auto& kv : r->kvs) {
+    const size_t slash = kv.first.find('/', base);
+    if (kv.first.size() <= base || slash == std::string::npos) continue;
+    Agg& a = groups[kv.first.substr(base, slash - base)];
+    std::vector<MemberInfo> one;
+    uint64_t e = 0;
+    if (!DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) || one.size() != 1)
+      continue;
+    const MemberInfo& m = one[0];
+    a.nodes++;
+    // version skew from the static info string ("ver=X,...") -- the one place
+    // we parse info at the MDS; everything numeric rides binary STA1.
+    size_t vp = m.info.find("ver=");
+    if (vp != std::string::npos) {
+      size_t ve = m.info.find(',', vp);
+      a.vers[m.info.substr(vp + 4, (ve == std::string::npos ? m.info.size() : ve) - vp - 4)]++;
+    }
+    if (!m.has_stats) { a.missing++; continue; }
+    const MemberStats& st = m.stats;
+    a.sum.capacity_bytes += st.capacity_bytes;
+    a.sum.used_bytes += st.used_bytes;
+    a.sum.objects += st.objects;
+    a.sum.hits_total += st.hits_total;
+    a.sum.misses_total += st.misses_total;
+    a.sum.evictions_total += st.evictions_total;
+    a.sum.puts_total += st.puts_total;
+    a.sum.put_busy_total += st.put_busy_total;
+    a.sum.dio_write_fallbacks += st.dio_write_fallbacks;
+    a.sum.ram_used_bytes += st.ram_used_bytes;
+    a.sum.ram_hits_total += st.ram_hits_total;
+  }
+  if (groups.empty()) return "";
+  std::string s;
+  auto emit = [&](const char* name, const char* help) {
+    s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+    s += "# TYPE "; s += name; s += " gauge\n";
+  };
+  auto line = [&](const char* name, const std::string& g, uint64_t v) {
+    s += name; s += "{group=\""; s += g; s += "\"} "; s += std::to_string(v); s += "\n";
+  };
+  // All ring aggregates are GAUGES (a node restart resets its counters, so the
+  // per-group sum can go down; rate analysis belongs on the node-level series).
+  emit("dfkv_mds_group_nodes", "Registered members per group");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_nodes", g, a.nodes);
+  emit("dfkv_mds_group_capacity_bytes", "Sum of member capacities per group");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_capacity_bytes", g, a.sum.capacity_bytes);
+  emit("dfkv_mds_group_used_bytes", "Sum of member used bytes per group (ring watermark)");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_used_bytes", g, a.sum.used_bytes);
+  emit("dfkv_mds_group_objects", "Sum of resident objects per group");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_objects", g, a.sum.objects);
+  emit("dfkv_mds_group_hits_sum", "Sum of member hit counters (resets with node restarts)");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_hits_sum", g, a.sum.hits_total);
+  emit("dfkv_mds_group_misses_sum", "Sum of member miss counters");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_misses_sum", g, a.sum.misses_total);
+  emit("dfkv_mds_group_evictions_sum", "Sum of member eviction counters");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_evictions_sum", g, a.sum.evictions_total);
+  emit("dfkv_mds_group_puts_sum", "Sum of member put counters");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_puts_sum", g, a.sum.puts_total);
+  emit("dfkv_mds_group_put_busy_sum", "Sum of admission-gate rejections");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_put_busy_sum", g, a.sum.put_busy_total);
+  emit("dfkv_mds_group_dio_fallbacks_sum", "Sum of direct-mode buffered fallbacks (page-cache alarm)");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_dio_fallbacks_sum", g, a.sum.dio_write_fallbacks);
+  emit("dfkv_mds_group_ram_used_bytes", "Sum of RAM-tier resident bytes per group");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_ram_used_bytes", g, a.sum.ram_used_bytes);
+  emit("dfkv_mds_group_ram_hits_sum", "Sum of RAM-tier hit counters");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_ram_hits_sum", g, a.sum.ram_hits_total);
+  emit("dfkv_mds_group_stats_missing", "Members without STA1 stats (pre-upgrade nodes)");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_stats_missing", g, a.missing);
+  emit("dfkv_mds_group_version_skew", "Distinct member versions per group (>1 = drift)");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_version_skew", g, a.vers.size());
+  return s;
+}
+
 void MdsServer::Handle(int fd) {
   while (running_) {
     char prefix[kReqPrefix];
@@ -197,6 +304,8 @@ void MdsServer::Handle(int fd) {
     } else if (op == WireOp::kListMembers) {
       std::string group(payload.data(), rq.payload_len);
       st = ListMembers(group, &data);
+    } else if (op == WireOp::kListGroups) {
+      st = ListGroups(&data);
     }
 
     char rp[kRespPrefix];

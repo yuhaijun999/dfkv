@@ -25,6 +25,7 @@
 #include "transport/tcp_transport.h"
 #include "common/value_header.h"
 #include "common/version.h"
+#include "utils/wire_limits.h"
 
 using namespace dfkv;  // NOLINT
 
@@ -54,6 +55,117 @@ static bool QueryMembers(const std::string& mds, const std::string& group,
   // instances are healthy (RUNBOOK uses `dfkvctl ring` to verify upgrades).
   for (size_t i = 0; i < eps.size() && !got; ++i) poller.PollOnce();
   return got;
+}
+
+// Raw kListGroups roundtrip against any one reachable MDS endpoint: returns
+// the newline-joined distinct group names.
+static bool QueryGroups(const std::string& mds, std::vector<std::string>* out) {
+  for (const auto& ep : SplitCsv(mds)) {
+    int fd = net::Dial(ep, 2000, 2000);
+    if (fd < 0) continue;
+    char pre[kReqPrefix];
+    EncodeReq(pre, WireOp::kListGroups, BlockKey{}, 0, 0, 0);
+    bool ok = net::WriteAll(fd, pre, kReqPrefix);
+    std::string data;
+    if (ok) {
+      char rp[kRespPrefix];
+      Status st = Status::kInvalid;
+      uint64_t dlen = 0;
+      ok = net::ReadAll(fd, rp, kRespPrefix) &&
+           DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) && st == Status::kOk;
+      if (ok) { data.resize(dlen); ok = (dlen == 0) || net::ReadAll(fd, &data[0], dlen); }
+    }
+    ::close(fd);
+    if (!ok) continue;
+    out->clear();
+    size_t i = 0;
+    while (i <= data.size()) {
+      size_t nl = data.find('\n', i);
+      if (nl == std::string::npos) nl = data.size();
+      if (nl > i) out->push_back(data.substr(i, nl - i));
+      if (nl == data.size()) break;
+      i = nl + 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+static std::string HumanBytes(uint64_t b) {
+  const char* u[] = {"B", "K", "M", "G", "T", "P"};
+  double v = static_cast<double>(b);
+  int i = 0;
+  while (v >= 1024.0 && i < 5) { v /= 1024.0; ++i; }
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.1f%s", v, u[i]);
+  return buf;
+}
+
+static std::string HumanSecs(uint64_t s) {
+  char buf[32];
+  if (s >= 86400) std::snprintf(buf, sizeof(buf), "%llud%lluh", (unsigned long long)s / 86400, ((unsigned long long)s % 86400) / 3600);
+  else if (s >= 3600) std::snprintf(buf, sizeof(buf), "%lluh%llum", (unsigned long long)s / 3600, ((unsigned long long)s % 3600) / 60);
+  else std::snprintf(buf, sizeof(buf), "%llum", (unsigned long long)s / 60);
+  return buf;
+}
+
+// Per-ring runtime stats straight from the MDS (values ride each member's
+// heartbeat, ~10s freshness): the fleet answer without touching any node.
+// dfkvctl stat --all remains the per-node deep-dive (full /metrics).
+static int CmdStats(const std::string& mds, const std::string& group) {
+  if (mds.empty()) { std::fprintf(stderr, "stats needs --mds ip:port[,...]\n"); return 2; }
+  std::vector<MemberInfo> ms;
+  if (!QueryMembers(mds, group, &ms)) { std::fprintf(stderr, "stats: MDS query failed\n"); return 1; }
+  std::printf("group=%s members=%zu (stats as of each node's last heartbeat)\n", group.c_str(), ms.size());
+  std::printf("%-16s %6s %14s %5s %8s %6s %7s %6s %7s %8s %7s\n",
+              "ID", "WEIGHT", "USED/CAP", "UTIL", "OBJ", "HIT%", "EVIC", "BUSY", "DIO-FB", "RAM-USED", "UPTIME");
+  MemberStats sum;
+  uint64_t missing = 0;
+  for (const auto& m : ms) {
+    if (!m.has_stats) {
+      std::printf("%-16s %6u %14s\n", m.id.c_str(), m.weight, "(no stats: pre-upgrade node)");
+      ++missing;
+      continue;
+    }
+    const MemberStats& st = m.stats;
+    const double util = st.capacity_bytes
+        ? 100.0 * static_cast<double>(st.used_bytes) / static_cast<double>(st.capacity_bytes) : 0.0;
+    const uint64_t lookups = st.hits_total + st.misses_total;
+    const double hitp = lookups ? 100.0 * static_cast<double>(st.hits_total) / static_cast<double>(lookups) : 0.0;
+    std::printf("%-16s %6u %14s %4.0f%% %8llu %5.1f%% %7llu %6llu %7llu %8s %7s\n",
+                m.id.c_str(), m.weight,
+                (HumanBytes(st.used_bytes) + "/" + HumanBytes(st.capacity_bytes)).c_str(), util,
+                (unsigned long long)st.objects, hitp,
+                (unsigned long long)st.evictions_total, (unsigned long long)st.put_busy_total,
+                (unsigned long long)st.dio_write_fallbacks,
+                st.ram_used_bytes ? HumanBytes(st.ram_used_bytes).c_str() : "-",
+                HumanSecs(st.uptime_seconds).c_str());
+    sum.capacity_bytes += st.capacity_bytes; sum.used_bytes += st.used_bytes;
+    sum.objects += st.objects; sum.hits_total += st.hits_total; sum.misses_total += st.misses_total;
+    sum.evictions_total += st.evictions_total; sum.put_busy_total += st.put_busy_total;
+    sum.dio_write_fallbacks += st.dio_write_fallbacks; sum.ram_used_bytes += st.ram_used_bytes;
+  }
+  const uint64_t lk = sum.hits_total + sum.misses_total;
+  std::printf("-- group=%s: %zu nodes  %s/%s (%.0f%%)  hit %.1f%%  evic %llu  busy %llu  dio-fb %llu  ram %s  stats-missing %llu\n",
+              group.c_str(), ms.size(), HumanBytes(sum.used_bytes).c_str(), HumanBytes(sum.capacity_bytes).c_str(),
+              sum.capacity_bytes ? 100.0 * (double)sum.used_bytes / (double)sum.capacity_bytes : 0.0,
+              lk ? 100.0 * (double)sum.hits_total / (double)lk : 0.0,
+              (unsigned long long)sum.evictions_total, (unsigned long long)sum.put_busy_total,
+              (unsigned long long)sum.dio_write_fallbacks, HumanBytes(sum.ram_used_bytes).c_str(),
+              (unsigned long long)missing);
+  return 0;
+}
+
+static int CmdStatsAllGroups(const std::string& mds) {
+  std::vector<std::string> groups;
+  if (!QueryGroups(mds, &groups)) { std::fprintf(stderr, "stats --all: kListGroups failed (MDS < 1.10?)\n"); return 1; }
+  if (groups.empty()) { std::printf("no groups registered\n"); return 0; }
+  int rc = 0;
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (i) std::printf("\n");
+    rc |= CmdStats(mds, groups[i]);
+  }
+  return rc;
 }
 
 static int CmdRing(const std::string& mds, const std::string& group) {
@@ -163,11 +275,15 @@ int main(int argc, char** argv) {
     else if (a == "--mla") nv32(&mla);
     else pos.push_back(a);
   }
-  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] put|get|exist|stat|ring ...\n"); return 2; }
+  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] put|get|exist|stat|stats|ring ...\n"); return 2; }
   const std::string& cmd = pos[0];
 
   if (cmd == "ring") return CmdRing(mds, group);
 
+  if (cmd == "stats") {
+    if (all) return CmdStatsAllGroups(mds);
+    return CmdStats(mds, group);
+  }
   if (cmd == "stat") {
     if (all) return CmdStatAll(mds, group, stat_port);
     if (pos.size() < 2) { std::fprintf(stderr, "stat <node-ip:port>  |  stat --all --mds ... [--stat-port <p>]\n"); return 2; }

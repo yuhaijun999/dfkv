@@ -196,3 +196,62 @@ TEST(MdsServer, InfoFlowsRegisterThroughEtcdToList) {
   EXPECT_EQ(epoch, epoch_before) << "info change must not bump the ring epoch";
   mds.Stop();
 }
+
+TEST(MdsServer, StatsFlowThroughEtcdAndAggregateInMetrics) {
+  // STA1 stats: register -> etcd -> ListMembers round-trip; heartbeat refresh;
+  // GroupMetricsText aggregates per group; ListGroups enumerates the group.
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  std::string group = "itest-stats-" + std::to_string(port);
+
+  MemberInfo m{"ns", "10.1.1.10", 28001, 1, 28100, "ver=1.10.0"};
+  m.stats.capacity_bytes = 1000;
+  m.stats.used_bytes = 250;
+  m.stats.objects = 5;
+  m.stats.hits_total = 90;
+  m.stats.misses_total = 10;
+  m.has_stats = true;
+  Status st; std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(group, m), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+
+  // Round-trip via kListMembers
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t epoch1 = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &epoch1));
+  ASSERT_EQ(got.size(), 1u);
+  ASSERT_TRUE(got[0].has_stats);
+  EXPECT_EQ(got[0].stats.used_bytes, 250u);
+  EXPECT_EQ(got[0].stats.hits_total, 90u);
+
+  // Heartbeat with UPDATED stats refreshes the value; epoch must NOT move.
+  m.stats.used_bytes = 400;
+  ASSERT_TRUE(DoReq(port, WireOp::kHeartbeat, EncodeMemberReq(group, m), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));
+  std::vector<MemberInfo> got2; uint64_t epoch2 = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got2, &epoch2));
+  ASSERT_EQ(got2.size(), 1u);
+  EXPECT_EQ(got2[0].stats.used_bytes, 400u);
+  EXPECT_EQ(epoch1, epoch2) << "stats churn must not move the ring epoch";
+
+  // Group aggregates appear in the MDS metrics text.
+  const std::string mt = mds.MetricsText();
+  EXPECT_NE(mt.find("dfkv_mds_group_used_bytes{group=\"" + group + "\"} 400"),
+            std::string::npos) << mt;
+  EXPECT_NE(mt.find("dfkv_mds_group_capacity_bytes{group=\"" + group + "\"} 1000"),
+            std::string::npos);
+  EXPECT_NE(mt.find("dfkv_mds_group_nodes{group=\"" + group + "\"} 1"),
+            std::string::npos);
+  EXPECT_NE(mt.find("dfkv_mds_group_stats_missing{group=\"" + group + "\"} 0"),
+            std::string::npos);
+
+  // kListGroups enumerates it.
+  ASSERT_TRUE(DoReq(port, WireOp::kListGroups, "", &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  EXPECT_NE(data.find(group), std::string::npos);
+}

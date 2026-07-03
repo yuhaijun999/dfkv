@@ -49,6 +49,16 @@ class KvNodeServer {
   int port() const { return port_; }
   size_t Count() const { return group_.Count(); }
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
+  // Accessors for the MDS heartbeat stats provider (STA1) -- all cheap reads.
+  uint64_t Evictions() const { return group_.Evictions(); }
+  uint64_t PutBusyTotal() const { return put_busy_.load(std::memory_order_relaxed); }
+  uint64_t DioWriteFallbacks() const { return group_.SlabStats().dio_write_fallbacks; }
+  uint64_t RamUsedBytes() const { return ram_ ? ram_->UsedBytes() : 0; }
+  uint64_t RamHits() const { return ram_ ? ram_->Hits() : 0; }
+  uint64_t UptimeSeconds() const {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start_time_).count());
+  }
   size_t DiskCount() const { return group_.DiskCount(); }
   size_t AcceptCount() const { return accept_count_.load(std::memory_order_relaxed); }
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)

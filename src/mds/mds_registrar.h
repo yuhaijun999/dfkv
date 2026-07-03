@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include <functional>
+
 #include "mds/mds_endpoints.h"
 #include "common/membership.h"
 
@@ -26,6 +28,12 @@ class MdsRegistrar {
   void Start();
   void Stop();
 
+  // Optional dynamic-stats provider: called right before EVERY register/
+  // heartbeat encode, so the STA1 payload carries values as of that beat
+  // (~heartbeat_ms freshness at the MDS). Unset = no STA1 (legacy behavior).
+  using StatsFn = std::function<MemberStats()>;
+  void set_stats_provider(StatsFn fn) { stats_fn_ = std::move(fn); }
+
   bool RegisterOnce();
   bool HeartbeatOnce();
 
@@ -38,6 +46,7 @@ class MdsRegistrar {
   MdsEndpoints eps_;
   std::string group_;
   MemberInfo self_;
+  StatsFn stats_fn_;
   int hb_ms_;
   int io_ms_;
   std::atomic<bool> running_{false};

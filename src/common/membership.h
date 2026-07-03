@@ -11,6 +11,29 @@
 
 namespace dfkv {
 
+// Dynamic runtime stats a node reports on register/heartbeat (STA1 trailing
+// extension, ~10s freshness). Fixed field ORDER is the wire contract -- extend
+// by APPENDING (the on-wire field count lets old decoders skip unknown tails).
+// All counters are per-node monotonic since process start; uptime_seconds is
+// the reset anchor (a restart zeroes them). Excluded from operator== and
+// MembersEpoch like every other extension: stats churn every heartbeat and
+// must never rebuild client rings.
+struct MemberStats {
+  uint64_t capacity_bytes = 0;        // configured cap (static; binary twin of info cap=)
+  uint64_t used_bytes = 0;            // engine-reported (slab: slot bytes; file: payload bytes)
+  uint64_t objects = 0;
+  uint64_t hits_total = 0;
+  uint64_t misses_total = 0;
+  uint64_t evictions_total = 0;
+  uint64_t puts_total = 0;
+  uint64_t uptime_seconds = 0;
+  uint64_t put_busy_total = 0;        // admission-gate rejections
+  uint64_t dio_write_fallbacks = 0;   // direct-mode buffered fallbacks ("page cache crept back")
+  uint64_t ram_used_bytes = 0;        // RAM tier resident slot bytes (0 = tier off)
+  uint64_t ram_hits_total = 0;
+};
+constexpr uint32_t kMemberStatsFields = 12;  // == u64 count above, wire order
+
 struct MemberInfo {
   std::string id;
   std::string ip;
@@ -22,6 +45,11 @@ struct MemberInfo {
   // Purely informational: surfaced by `dfkvctl ring` for fleet audit (version skew,
   // silently-skipped upgrades, engine mismatch) without per-node ssh.
   std::string info;
+  // Dynamic stats (STA1); has_stats=false = legacy peer / no report yet.
+  // LAST members on purpose: MemberInfo is aggregate-initialized positionally
+  // in tests/tools, and appending keeps those initializers valid.
+  MemberStats stats;
+  bool has_stats = false;
   // tcp_port and info ride OPTIONAL trailing extensions in Encode/DecodeMembers, so peers
   // that don't send them still interoperate. Both are intentionally EXCLUDED from
   // operator== and MembersEpoch: they are orthogonal metadata (not part of ring
@@ -54,6 +82,7 @@ inline bool IsValidGroupOrId(const std::string& s) {
 // invisible to peers that predate them.
 constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1": one tcp_port u32 per member
 constexpr uint32_t kMemberExtInfo = 0x4E464F31u;     // "NFO1": one length-prefixed info string per member
+constexpr uint32_t kMemberExtStats = 0x31415453u;    // "STA1": nfields u8 then per member { has u8 [nfields x u64] }
 
 // Wire format for a membership view. Register payload = 1 member; ListMembers
 // response = N members + the epoch (etcd revision) clients compare to skip
@@ -86,6 +115,26 @@ inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
   for (const auto& m : ms) {
     net::PutU32(num, static_cast<uint32_t>(m.info.size())); out.append(num, 4);
     out += m.info;
+  }
+  // STA1: dynamic stats. nfields on the wire (not a version) so appending
+  // fields later needs no new tag: an older decoder reads the fields it knows
+  // and skips the tail. Per-member `has` flag: a kList response mixes members
+  // from different node versions, so presence is per member, not per message.
+  net::PutU32(num, kMemberExtStats); out.append(num, 4);
+  out.push_back(static_cast<char>(kMemberStatsFields));
+  char u64buf[8];
+  for (const auto& m : ms) {
+    out.push_back(m.has_stats ? 1 : 0);
+    if (!m.has_stats) continue;
+    const uint64_t f[kMemberStatsFields] = {
+        m.stats.capacity_bytes, m.stats.used_bytes, m.stats.objects,
+        m.stats.hits_total, m.stats.misses_total, m.stats.evictions_total,
+        m.stats.puts_total, m.stats.uptime_seconds, m.stats.put_busy_total,
+        m.stats.dio_write_fallbacks, m.stats.ram_used_bytes, m.stats.ram_hits_total};
+    for (uint32_t k = 0; k < kMemberStatsFields; ++k) {
+      net::PutU64(u64buf, f[k]);
+      out.append(u64buf, 8);
+    }
   }
   return out;
 }
@@ -131,6 +180,28 @@ inline bool DecodeMembers(const char* p, size_t n,
         uint32_t ilen = net::GetU32(p + off); off += 4;
         if (off + ilen > n) { ok = false; break; }
         (*out)[i].info.assign(p + off, ilen); off += ilen;
+      }
+      if (!ok) break;
+    } else if (tag == kMemberExtStats) {
+      off += 4;
+      if (off + 1 > n) break;
+      const uint32_t nf = static_cast<uint8_t>(p[off]); off += 1;
+      const uint32_t known = nf < kMemberStatsFields ? nf : kMemberStatsFields;
+      bool ok = true;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (off + 1 > n) { ok = false; break; }
+        const bool has = p[off] != 0; off += 1;
+        if (!has) continue;
+        if (off + static_cast<size_t>(nf) * 8 > n) { ok = false; break; }
+        uint64_t f[kMemberStatsFields] = {0};
+        for (uint32_t k = 0; k < known; ++k) f[k] = net::GetU64(p + off + k * 8);
+        off += static_cast<size_t>(nf) * 8;  // skip unknown appended fields too
+        MemberStats& st = (*out)[i].stats;
+        st.capacity_bytes = f[0]; st.used_bytes = f[1]; st.objects = f[2];
+        st.hits_total = f[3]; st.misses_total = f[4]; st.evictions_total = f[5];
+        st.puts_total = f[6]; st.uptime_seconds = f[7]; st.put_busy_total = f[8];
+        st.dio_write_fallbacks = f[9]; st.ram_used_bytes = f[10]; st.ram_hits_total = f[11];
+        (*out)[i].has_stats = true;
       }
       if (!ok) break;
     } else {

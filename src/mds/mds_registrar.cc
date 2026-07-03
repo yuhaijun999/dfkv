@@ -37,6 +37,10 @@ bool MdsRegistrar::SendOnce(uint8_t op) {
   int fd = net::Dial(ep, io_ms_, io_ms_);
   if (fd < 0) { eps_.MarkFailed(ep, now); return false; }
 
+  if (stats_fn_) {  // refresh dynamic stats for this beat (STA1)
+    self_.stats = stats_fn_();
+    self_.has_stats = true;
+  }
   std::string payload = EncodeMemberReq(group_, self_);
   char pre[kReqPrefix];
   EncodeReq(pre, static_cast<WireOp>(op), BlockKey{}, 0, 0, payload.size());

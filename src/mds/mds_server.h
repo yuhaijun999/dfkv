@@ -30,7 +30,16 @@ class MdsServer {
   Status Start(int port);
   void Stop();
   int port() const { return port_; }
-  std::string MetricsText() const { return metrics_.Render(); }
+  // Static counters + per-group ring aggregates. The aggregate half does ONE
+  // etcd prefix range over /dfkv/v1/groups/ at scrape time (MDS stays
+  // stateless; ~30s Prometheus cadence makes this negligible), decodes each
+  // member's STA1 stats and sums them per group -- ring capacity / usage /
+  // hit-rate / alarm counters become one MDS scrape instead of a fleet sweep.
+  std::string MetricsText() { return metrics_.Render() + GroupMetricsText(); }
+  std::string GroupMetricsText();
+  // kListGroups backend: distinct group names under /dfkv/v1/groups/ (newline-
+  // joined). Feeds `dfkvctl stats --all`.
+  Status ListGroups(std::string* out);
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
 
   // One read against etcd (a bounded RangePrefix on a probe key). Returns true
