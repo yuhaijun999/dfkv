@@ -30,14 +30,31 @@ namespace rdma {
 
 // QP connection info exchanged over the TCP bootstrap channel (fixed 32 bytes,
 // little-endian). lid==0 => use GRH/GID routing (RoCE); else IB LID routing.
+//
+// Wire layout: qpn u32 | psn u32 | lid u16 | gid[16] | pad[6]. Peers before the
+// depth negotiation MEMSET the whole 32 bytes and never read the pad, so the
+// pad is a deterministic-zero extension area: a non-zero magic there can ONLY
+// come from a peer that wrote it on purpose -- exact detection, no length
+// change, and every old/new pairing keeps connecting (a rolling-upgrade
+// requirement; contrast the MDS member codec, which was born with tagged
+// trailing extensions, while this blob was not).
+//
+// Extension DPQ1 (pad bytes [26,30) = magic, [30,32) = depth u16): each side
+// advertises its pipeline depth -- how many in-flight requests its posted
+// receives absorb. The CLIENT acts on it: pipelining past the server's posted
+// receives hits RNR retries and degrades silently 3-4x (measured on hd05), so
+// the client clamps its batching window to the advertised value
+// (RcEndpoint::window()). depth==0 = legacy peer / no advertisement.
 struct QpInfo {
   uint32_t qpn = 0;
   uint32_t psn = 0;
   uint16_t lid = 0;
   uint8_t gid[16] = {0};
   uint8_t pad[6] = {0};
+  uint16_t depth = 0;  // not a standalone wire field: rides the pad (see above)
 };
 constexpr size_t kQpInfoBytes = 32;
+constexpr uint32_t kQpDepthMagic = 0x31515044u;  // ASCII DPQ1 (LE)
 void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]);
 QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 
@@ -75,6 +92,16 @@ class RcEndpoint {
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
 
   size_t depth() const { return depth_; }
+  // Depth negotiation (DPQ1): the peer's advertised pipeline depth (0 = legacy
+  // peer, unknown). window() is the SAFE batching window -- never pipeline more
+  // requests than the peer's posted receives, or they RNR-retry and the whole
+  // window degrades silently. Falls back to the local depth against legacy
+  // peers (the pre-negotiation behavior: an ops-level contract).
+  void set_remote_depth(uint16_t d) { remote_depth_ = d; }
+  uint16_t remote_depth() const { return remote_depth_; }
+  size_t window() const {
+    return (remote_depth_ > 0 && remote_depth_ < depth_) ? remote_depth_ : depth_;
+  }
   size_t user_mr_cap() const { return user_mr_cap_; }  // >= depth (test/diagnostic)
   size_t cap() const { return cap_; }
   int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
@@ -173,6 +200,7 @@ class RcEndpoint {
   unsigned cq_armed_unacked_ = 0;
 
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
+  uint16_t remote_depth_ = 0;  // DPQ1 advertisement from the peer (0 = legacy)
   size_t max_sge_ = 2;  // QP max_send_sge/max_recv_sge = min(kMaxSge, device cap)
   std::vector<char*> sbuf_, rbuf_, dbuf_;
   std::vector<ibv_mr*> smr_, rmr_, dmr_;

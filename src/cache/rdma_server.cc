@@ -216,7 +216,9 @@ void RdmaServer::Serve(int boot_fd) {
   numa::PinThreadToNode(ep.numa_node());  // keep this conn's serve thread NUMA-local to its NIC
   // QP bootstrap: read client's info, send ours (symmetric to the client).
   char peer[rdma::kQpInfoBytes], mine[rdma::kQpInfoBytes];
-  rdma::SerializeQpInfo(ep.Local(), mine);
+  rdma::QpInfo my = ep.Local();
+  my.depth = static_cast<uint16_t>(std::min<size_t>(K, 256));  // DPQ1: advertise our posted-recv depth
+  rdma::SerializeQpInfo(my, mine);
   if (!net::ReadAll(boot_fd, peer, rdma::kQpInfoBytes) ||
       !net::WriteAll(boot_fd, mine, rdma::kQpInfoBytes)) {
     ::close(boot_fd); return;

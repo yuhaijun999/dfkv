@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 
+#include "utils/log.h"
 #include "utils/net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
 #include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "utils/numa_util.h"     // numa::DeviceNode / CurrentNode / Enabled
@@ -180,13 +181,25 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   std::memset(devbuf, 0, sizeof(devbuf));
   std::memcpy(devbuf, dev.data(), std::min(dev.size(), sizeof(devbuf) - 1));
   char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
-  rdma::SerializeQpInfo(c->ep.Local(), mine);
+  rdma::QpInfo my = c->ep.Local();
+  my.depth = static_cast<uint16_t>(std::min<size_t>(depth_, 256));  // DPQ1 advertisement
+  rdma::SerializeQpInfo(my, mine);
   if (!net::WriteAll(fd, devbuf, rdma::kDevNameBytes) ||
       !net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
       !net::ReadAll(fd, peer, rdma::kQpInfoBytes)) {
     ::close(fd); delete c; return nullptr;
   }
-  if (!c->ep.Connect(rdma::ParseQpInfo(peer))) { ::close(fd); delete c; return nullptr; }
+  const rdma::QpInfo pq = rdma::ParseQpInfo(peer);
+  if (!c->ep.Connect(pq)) { ::close(fd); delete c; return nullptr; }
+  // Honor the server's advertised depth: clamp our batching window so we never
+  // pipeline past its posted receives (RNR-retry silent degradation otherwise).
+  if (pq.depth > 0) {
+    c->ep.set_remote_depth(pq.depth);
+    if (pq.depth < depth_)
+      DFKV_LOG_INFO("rdma: server depth " + std::to_string(pq.depth) +
+                    " < client depth " + std::to_string(depth_) +
+                    ": batching window clamped to " + std::to_string(pq.depth));
+  }
   // Wait for the server's "ready" byte: it has posted its recvs, so our first
   // SEND won't hit RNR.
   char ready = 0;
@@ -339,7 +352,7 @@ std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
     Conn* c = Acquire(node, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);
@@ -387,7 +400,7 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
     Conn* c = Acquire(node, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);
@@ -437,7 +450,7 @@ std::vector<Status> RdmaTransport::ExistMany(const std::string& node,
     Conn* c = Acquire(node, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);
@@ -496,7 +509,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     Conn* c = Acquire(node, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);
@@ -578,7 +591,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
     Conn* c = Acquire(node, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);
@@ -670,7 +683,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       }
     }
 
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);
@@ -780,7 +793,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       }
     }
 
-    const size_t W = ep.depth();
+    const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
     bool conn_ok = true;
     for (size_t base = 0; base < n && conn_ok; base += W) {
       const size_t w = std::min(W, n - base);

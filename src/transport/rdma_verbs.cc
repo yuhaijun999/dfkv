@@ -133,6 +133,11 @@ void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]) {
   net::PutU32(out + 4, in.psn);
   std::memcpy(out + 8, &in.lid, 2);   // host LE; both ends x86_64
   std::memcpy(out + 10, in.gid, 16);
+  if (in.depth > 0) {                 // depth advertisement rides the pad (DPQ1)
+    net::PutU32(out + 26, kQpDepthMagic);
+    const uint16_t d = in.depth;
+    std::memcpy(out + 30, &d, 2);
+  }
 }
 
 QpInfo ParseQpInfo(const char in[kQpInfoBytes]) {
@@ -141,6 +146,12 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]) {
   q.psn = net::GetU32(in + 4);
   std::memcpy(&q.lid, in + 8, 2);
   std::memcpy(q.gid, in + 10, 16);
+  // Legacy peers memset the pad to zero, so the magic is an exact signal.
+  if (net::GetU32(in + 26) == kQpDepthMagic) {
+    uint16_t d = 0;
+    std::memcpy(&d, in + 30, 2);
+    if (d >= 1 && d <= 256) q.depth = d;  // out-of-range = treat as absent
+  }
   return q;
 }
 

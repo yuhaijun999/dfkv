@@ -122,6 +122,7 @@ if(DFKV_BUILD_TESTS)
   file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cc)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
@@ -132,6 +133,9 @@ if(DFKV_BUILD_TESTS)
     add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(rdma_loopback_test)
+    add_executable(qp_depth_negotiation_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
+    target_link_libraries(qp_depth_negotiation_test PRIVATE dfkv_core GTest::gtest_main)
+    gtest_discover_tests(qp_depth_negotiation_test)
   endif()
 
   # Python plugin test (ctypes -> libdfkv.so -> dfkv_server). No GPU/torch.
