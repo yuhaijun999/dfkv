@@ -21,6 +21,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <string>
+
+#include "transport/dev_frame.h"
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -60,7 +63,7 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 
 // Fixed-size device-name field the client sends first in the bootstrap so the
 // server opens its QP on the matching device (same rail) for multi-rail setups.
-constexpr size_t kDevNameBytes = 32;
+
 // Target QP scatter-gather entries. SGE0 is the header (req/resp prefix + value
 // header); the remaining kMaxSge-1 carry payload segments, so a scatter-gather
 // key may hold up to kMaxSge-1 (=29) non-contiguous buffers. Open() clamps this
